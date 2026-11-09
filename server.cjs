@@ -3,7 +3,6 @@
 // Uso:  node server.cjs   →  http://localhost:3001
 
 const http = require("http");
-const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -40,6 +39,7 @@ function pngChunk(type, data) {
 const iconCache = {};
 function makeIcon(S) {
   if (iconCache[S]) return iconCache[S];
+  // Una "M" blanca sobre degradado verde
   const lx = 0.3 * S, rx = 0.7 * S, ty = 0.32 * S, by = 0.68 * S, mx = 0.5 * S, my = 0.56 * S;
   const half = 0.045 * S;
   const segs = [[lx, by, lx, ty], [lx, ty, mx, my], [mx, my, rx, ty], [rx, ty, rx, by]];
@@ -68,8 +68,8 @@ function makeIcon(S) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(S, 0);
   ihdr.writeUInt32BE(S, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
+  ihdr[8] = 8; // 8 bits
+  ihdr[9] = 6; // RGBA
   const png = Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
     pngChunk("IHDR", ihdr),
@@ -99,119 +99,29 @@ const MANIFEST = {
 // ---------- Base de datos (archivo JSON) ----------
 let db = { users: {}, requests: [], messages: [], sessions: {}, vapid: null };
 try {
-  const fileData = fs.readFileSync(DB_FILE, "utf8");
-  if (fileData) {
-    db = { ...db, ...JSON.parse(fileData) };
-  }
-} catch (e) {
-  console.log("Creando nueva base de datos o usando estructura por defecto.");
-}
+  db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, "utf8")) };
+} catch {}
 
 let saveTimer = null;
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (err) => {
-      if (err) console.error("Error al guardar la base de datos:", err);
-    });
-  }, 200);
+  saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 200);
 }
 
-// ---------- Notificaciones push ----------
-const b64u = (buf) => Buffer.from(buf).toString("base64url");
-const unb64u = (str) => Buffer.from(str, "base64url");
-
-let vapid = null;
-function initVapid() {
-  let pubB64 = process.env.VAPID_PUBLIC_KEY;
-  let privB64 = process.env.VAPID_PRIVATE_KEY;
-  let fromEnv = !!(pubB64 && privB64);
-  if (!fromEnv && db.vapid && db.vapid.publicKey && db.vapid.privateKey) {
-    pubB64 = db.vapid.publicKey;
-    privB64 = db.vapid.privateKey;
-  }
-  if (!pubB64 || !privB64) {
-    const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-    const jwk = privateKey.export({ format: "jwk" });
-    pubB64 = b64u(Buffer.concat([Buffer.from([4]), unb64u(jwk.x), unb64u(jwk.y)]));
-    privB64 = jwk.d;
-    db.vapid = { publicKey: pubB64, privateKey: privB64 };
-    save();
-  }
-  const pubRaw = unb64u(pubB64);
-  const privateKey = crypto.createPrivateKey({
-    key: { kty: "EC", crv: "P-256", d: privB64, x: b64u(pubRaw.subarray(1, 33)), y: b64u(pubRaw.subarray(33, 65)) },
-    format: "jwk",
-  });
-  vapid = { publicKey: pubB64, privateKey, fromEnv, privB64 };
-}
-initVapid();
-
-function vapidHeader(endpoint) {
-  const head = b64u(JSON.stringify({ typ: "JWT", alg: "ES256" }));
-  const body = b64u(JSON.stringify({
-    aud: new URL(endpoint).origin,
-    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
-    sub: process.env.VAPID_SUBJECT || process.env.RENDER_EXTERNAL_URL || "mailto:meliox@example.com",
-  }));
-  const sig = crypto.sign("sha256", Buffer.from(head + "." + body), { key: vapid.privateKey, dsaEncoding: "ieee-p1363" });
-  return `vapid t=${head}.${body}.${b64u(sig)}, k=${vapid.publicKey}`;
+// ---------- Notificaciones push (opcional: npm install web-push) ----------
+let webpush = null;
+try { webpush = require("web-push"); } catch {}
+if (webpush) {
+  if (!db.vapid) { db.vapid = webpush.generateVAPIDKeys(); save(); }
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || "mailto:meliox@example.com",
+    db.vapid.publicKey,
+    db.vapid.privateKey
+  );
 }
 
-function encryptPayload(sub, payload, fixed) {
-  const uaPub = unb64u(sub.keys.p256dh);
-  const auth = unb64u(sub.keys.auth);
-  const ecdh = (fixed && fixed.ecdh) || crypto.createECDH("prime256v1");
-  if (!fixed || !fixed.ecdh) ecdh.generateKeys();
-  const asPub = ecdh.getPublicKey();
-  const secret = ecdh.computeSecret(uaPub);
-  const salt = (fixed && fixed.salt) || crypto.randomBytes(16);
-  const keyInfo = Buffer.concat([Buffer.from("WebPush: info\0"), uaPub, asPub]);
-  const ikm = Buffer.from(crypto.hkdfSync("sha256", secret, auth, keyInfo, 32));
-  const cek = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: aes128gcm\0"), 16));
-  const nonce = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: nonce\0"), 12));
-  const cipher = crypto.createCipheriv("aes-128-gcm", cek, nonce);
-  const enc = Buffer.concat([cipher.update(Buffer.concat([Buffer.from(payload), Buffer.from([2])])), cipher.final(), cipher.getAuthTag()]);
-  const header = Buffer.alloc(21);
-  salt.copy(header, 0);
-  header.writeUInt32BE(4096, 16);
-  header[20] = asPub.length;
-  return Buffer.concat([header, asPub, enc]);
-}
-
-function sendWebPush(sub, payload, { ttl = 86400, urgency = "high" } = {}) {
-  return new Promise((resolve, reject) => {
-    let body, u;
-    try { body = encryptPayload(sub, payload); u = new URL(sub.endpoint); } catch (e) { return reject(e); }
-    const req = https.request({
-      method: "POST",
-      hostname: u.hostname,
-      port: u.port || 443,
-      path: u.pathname + u.search,
-      timeout: 15000,
-      headers: {
-        "Content-Encoding": "aes128gcm",
-        "Content-Type": "application/octet-stream",
-        "Content-Length": body.length,
-        TTL: String(ttl),
-        Urgency: urgency,
-        Authorization: vapidHeader(sub.endpoint),
-      },
-    }, (res) => {
-      let d = "";
-      res.on("data", (c) => (d += c));
-      res.on("end", () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve({ status: res.statusCode });
-        else reject(Object.assign(new Error(d.slice(0, 200) || "HTTP " + res.statusCode), { statusCode: res.statusCode }));
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => req.destroy(new Error("tiempo agotado")));
-    req.end(body);
-  });
-}
-
-const clients = new Map();
+// ---------- Utilidades ----------
+const clients = new Map(); // teléfono -> Set de respuestas SSE
 
 function push(phone, event, data = {}) {
   for (const res of clients.get(phone) || []) {
@@ -219,9 +129,9 @@ function push(phone, event, data = {}) {
   }
 }
 
+// Avisa a los celulares/navegadores de `to` que `from` le escribió
 async function sendPush(to, from, text, extra = {}, opts = {}) {
-  const results = [];
-  if (!to || !to.push || !to.push.length) return results;
+  if (!webpush || !to || !to.push || !to.push.length) return;
   const payload = JSON.stringify({
     title: from.name,
     body: text.length > 140 ? text.slice(0, 137) + "…" : text,
@@ -231,20 +141,21 @@ async function sendPush(to, from, text, extra = {}, opts = {}) {
   });
   for (const sub of [...to.push]) {
     try {
-      const r = await sendWebPush(sub, payload, opts);
-      results.push({ ok: true, status: r.status });
+      await webpush.sendNotification(sub, payload, { TTL: 86400, urgency: "high", ...opts });
     } catch (e) {
-      results.push({ ok: false, status: e.statusCode, error: e.message });
       if (e.statusCode === 404 || e.statusCode === 410) {
+        // Ese dispositivo ya no existe: lo quito de la lista
         to.push = to.push.filter((s) => s.endpoint !== sub.endpoint);
         save();
+      } else {
+        console.error("push:", e.statusCode || e.message);
       }
     }
   }
-  return results;
 }
 
-const signals = new Map();
+// Señales de llamadas (WebRTC): se guardan unos segundos hasta que el destinatario las recoge
+const signals = new Map(); // teléfono -> [{from, type, id, data, video, ts}]
 const SIGNAL_TTL = 60000;
 const SIGNAL_TYPES = new Set(["offer", "answer", "ice", "end", "reject", "busy"]);
 
@@ -265,8 +176,7 @@ function readBody(req) {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      // Ampliado a 5MB seguros para evitar errores 413 con fotos de perfil grandes
-      if (data.length > 5_000_000) {
+      if (data.length > 2_000_000) {
         reject(Object.assign(new Error("Archivo demasiado grande"), { status: 413 }));
         req.destroy();
       }
@@ -322,12 +232,12 @@ async function api(req, res, url, p) {
     if (n.length < 2 || n.length > 30) fail(400, "El nombre debe tener entre 2 y 30 letras.");
     if (!PHONE_RE.test(String(phone || ""))) fail(400, "El número debe empezar con 3 y tener exactamente 10 dígitos.");
     if (String(password || "").length < 6) fail(400, "La contraseña debe tener mínimo 6 caracteres.");
-    if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 4_000_000) {
-      fail(400, "Foto no válida o demasiado pesada.");
+    if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 600_000) {
+      fail(400, "Foto no válida.");
     }
     if (db.users[phone]) fail(409, "Ese número ya está registrado.");
     const salt = crypto.randomBytes(16).toString("hex");
-    db.users[phone] = { phone, name: n, photo, salt, hash: hashPass(password, salt), friends: [], push: [] };
+    db.users[phone] = { phone, name: n, photo, salt, hash: hashPass(password, salt), friends: [] };
     const token = newSession(phone);
     save();
     return json(res, 200, { token, me: pub(db.users[phone]) });
@@ -364,15 +274,17 @@ async function api(req, res, url, p) {
   }
 
   if (m === "GET" && p === "/api/push/key") {
-    return json(res, 200, { key: vapid.publicKey });
+    return json(res, 200, { key: webpush ? db.vapid.publicKey : null });
   }
 
   if (m === "POST" && p === "/api/push/subscribe") {
+    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     const { subscription: s } = await readBody(req);
     const ok =
       s && typeof s.endpoint === "string" && s.endpoint.startsWith("https://") && s.endpoint.length < 1000 &&
       s.keys && typeof s.keys.p256dh === "string" && typeof s.keys.auth === "string";
     if (!ok) fail(400, "Suscripción no válida.");
+    // Un dispositivo pertenece a una sola persona: lo quito de cualquier otra cuenta
     for (const u of Object.values(db.users)) {
       if (u.push) u.push = u.push.filter((x) => x.endpoint !== s.endpoint);
     }
@@ -392,15 +304,11 @@ async function api(req, res, url, p) {
   }
 
   if (m === "POST" && p === "/api/push/test") {
+    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     if (!user.push || !user.push.length) fail(400, "Este dispositivo todavía no está suscrito.");
-    await new Promise((r) => setTimeout(r, 5000));
-    const results = await sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" });
-    const good = results.filter((r) => r.ok).length;
-    if (!good) {
-      const bad = results[0] || {};
-      fail(502, "El servicio de notificaciones del celular rechazó el envío (" + (bad.status || bad.error || "sin respuesta") + ").");
-    }
-    return json(res, 200, { ok: true, sent: good });
+    // Espera 5 s para que alcances a minimizar la app y veas la notificación
+    setTimeout(() => sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" }), 5000);
+    return json(res, 200, { ok: true });
   }
 
   if (m === "GET" && p === "/api/signals") {
@@ -421,13 +329,12 @@ async function api(req, res, url, p) {
     signals.set(to, q.slice(-60));
     push(to, "signal");
     const target = db.users[to];
-    if (target) {
-      if (type === "offer") {
-        sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
-          { type: "call", tag: "call-" + user.phone }, { ttl: 30 });
-      } else if (type === "end" && missed) {
-        sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
-      }
+    if (type === "offer") {
+      // Suena en el celular aunque la app esté cerrada
+      sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
+        { type: "call", tag: "call-" + user.phone }, { TTL: 30 });
+    } else if (type === "end" && missed) {
+      sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
     }
     return json(res, 200, { ok: true });
   }
@@ -441,14 +348,15 @@ async function api(req, res, url, p) {
       if (newName.length < 2 || newName.length > 30) fail(400, "El nombre debe tener entre 2 y 30 letras.");
     }
     if (photo !== undefined) {
-      if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 4_000_000) {
-        fail(400, "Foto no válida o demasiado pesada.");
+      if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 600_000) {
+        fail(400, "Foto no válida.");
       }
       newPhoto = photo;
     }
     user.name = newName;
     user.photo = newPhoto;
     save();
+    // Avisa a amigos, a quienes tienen una solicitud mía y a mis otras pestañas
     const notify = new Set([
       ...user.friends,
       ...db.requests.filter((r) => r.from === user.phone).map((r) => r.to),
@@ -467,11 +375,12 @@ async function api(req, res, url, p) {
     if (user.friends.includes(phone)) fail(409, "Ya son amigos.");
     if (db.requests.some((r) => r.from === user.phone && r.to === phone)) fail(409, "Ya enviaste una solicitud a esta persona.");
 
+    // Si la otra persona ya te había enviado solicitud, se aceptan directo
     const reverse = db.requests.findIndex((r) => r.from === phone && r.to === user.phone);
     if (reverse >= 0) {
       db.requests.splice(reverse, 1);
-      if (!user.friends.includes(phone)) user.friends.push(phone);
-      if (!target.friends.includes(user.phone)) target.friends.push(user.phone);
+      user.friends.push(phone);
+      target.friends.push(user.phone);
       save();
       push(phone, "friends");
       return json(res, 200, { status: "accepted", name: target.name });
@@ -498,11 +407,10 @@ async function api(req, res, url, p) {
 
   if (m === "POST" && p === "/api/friends/remove") {
     const { phone } = await readBody(req);
+    if (!user.friends.includes(phone)) fail(404, "Esa persona no está en tus amigos.");
     user.friends = user.friends.filter((x) => x !== phone);
     const other = db.users[phone];
-    if (other) {
-      other.friends = other.friends.filter((x) => x !== user.phone);
-    }
+    if (other) other.friends = other.friends.filter((x) => x !== user.phone);
     db.requests = db.requests.filter(
       (r) => !((r.from === user.phone && r.to === phone) || (r.from === phone && r.to === user.phone))
     );
@@ -535,10 +443,8 @@ async function api(req, res, url, p) {
     db.messages.push(msg);
     save();
     push(to, "newmsg", { from: user.phone });
-    if (db.users[to]) {
-      sendPush(db.users[to], user, t);
-    }
-    push(user.phone, "friends");
+    sendPush(db.users[to], user, t); // notificación al celular (no espera respuesta)
+    push(user.phone, "friends"); // sincroniza otras pestañas mías
     return json(res, 200, msg);
   }
 
@@ -572,11 +478,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (p === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("ok");
-  }
-
   if (p === "/manifest.webmanifest") {
     res.writeHead(200, { "Content-Type": "application/manifest+json; charset=utf-8" });
     return res.end(JSON.stringify(MANIFEST));
@@ -591,22 +492,28 @@ const server = http.createServer(async (req, res) => {
   fs.readFile(path.join(__dirname, file[0]), (err, data) => {
     if (err) { res.writeHead(404); return res.end("No encontrado"); }
     const headers = { "Content-Type": file[1] };
-    if (p === "/sw.js") headers["Cache-Control"] = "no-cache";
+    if (p === "/sw.js") headers["Cache-Control"] = "no-cache"; // el service worker siempre fresco
     res.writeHead(200, headers);
     res.end(data);
   });
 });
 
+// Mantiene vivas las conexiones en tiempo real
 setInterval(() => {
   for (const set of clients.values()) for (const res of set) res.write(": ping\n\n");
 }, 25000);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`\nMeliox listo en http://localhost:${PORT}`);
-  console.log("Notificaciones push: activas");
-  if (!vapid.fromEnv) {
-    console.log("Variables VAPID generadas automáticamente.");
+  console.log(
+    webpush
+      ? "Notificaciones push: activas"
+      : "Notificaciones push: DESACTIVADAS (falta instalar. Corre:  npm install web-push)"
+  );
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const i of list || []) {
+      if (i.family === "IPv4" && !i.internal) console.log(`Desde otro celular en tu Wi-Fi: http://${i.address}:${PORT}`);
+    }
   }
+  console.log("");
 });
-
-module.exports = { encryptPayload, vapidHeader, initVapid };
