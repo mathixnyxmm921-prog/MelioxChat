@@ -306,7 +306,8 @@ async function refreshMe() {
 
   // Contador de mensajes sin leer en la pestaña y en el ícono de la app
   const unreadTotal = friends.reduce((a, f) => a + (f.unread || 0), 0);
-  document.title = unreadTotal ? `(${unreadTotal}) Meliox` : "Meliox";
+  baseTitle = unreadTotal ? `(${unreadTotal}) Meliox` : "Meliox";
+  if (!blinkTimer) document.title = baseTitle;
   try {
     if (navigator.setAppBadge) {
       (unreadTotal ? navigator.setAppBadge(unreadTotal) : navigator.clearAppBadge()).catch(() => {});
@@ -613,6 +614,70 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeModal(); closeProfile(); closeCtx(); closeConfirm(); }
 });
 
+// ---------- Sonidos (sin archivos: se generan con el navegador) ----------
+let audioCtx = null;
+function unlockAudio() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch {}
+}
+["pointerdown", "keydown", "touchstart"].forEach((ev) => document.addEventListener(ev, unlockAudio, { passive: true }));
+
+function tone(freq, start, dur, vol = 0.15) {
+  if (!audioCtx) return;
+  try {
+    const t0 = audioCtx.currentTime + start;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + 0.02);
+    g.gain.linearRampToValueAtTime(0, t0 + dur);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
+  } catch {}
+}
+const playMsgSound = () => { tone(880, 0, 0.12); tone(1175, 0.13, 0.2); };
+const vibrate = (p) => { try { navigator.vibrate && navigator.vibrate(p); } catch {} };
+
+let ringTimer = null;
+function startRing(kind) {
+  stopRing();
+  const once = kind === "in"
+    ? () => { tone(659, 0, 0.25, 0.22); tone(523, 0.3, 0.25, 0.22); tone(659, 0.8, 0.25, 0.22); tone(523, 1.1, 0.25, 0.22); vibrate([400, 200, 400]); }
+    : () => tone(440, 0, 1.0, 0.08);
+  once();
+  ringTimer = setInterval(once, kind === "in" ? 2400 : 3000);
+}
+function stopRing() {
+  clearInterval(ringTimer);
+  ringTimer = null;
+  vibrate(0);
+}
+
+// Título parpadeante cuando llega un mensaje y la pestaña está en segundo plano
+let baseTitle = "Meliox";
+let blinkTimer = null;
+function blinkTitle() {
+  if (!document.hidden || blinkTimer) return;
+  let on = false;
+  blinkTimer = setInterval(() => {
+    on = !on;
+    document.title = on ? "💬 ¡Mensaje nuevo!" : baseTitle;
+  }, 1000);
+}
+function stopBlink() {
+  if (!blinkTimer) return;
+  clearInterval(blinkTimer);
+  blinkTimer = null;
+  document.title = baseTitle;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) stopBlink(); });
+
 // ---------- Notificaciones (push en el celular, como WhatsApp) ----------
 const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
 const isStandalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
@@ -622,13 +687,30 @@ const pushSupported =
 const notifBanner = $("#notif-banner");
 const notifText = $("#notif-text");
 const notifBtn = $("#notif-btn");
+let notifAction = null;
+let notifHideTimer = null;
 
-function showNotifBanner(text, withButton) {
+function showNotifBanner(text, btn) {
+  clearTimeout(notifHideTimer);
   notifText.textContent = text;
-  notifBtn.classList.toggle("hidden", !withButton);
+  notifAction = btn ? btn.action : null;
+  notifBtn.textContent = btn ? btn.label : "";
+  notifBtn.classList.toggle("hidden", !btn);
   notifBanner.classList.remove("hidden");
 }
-const hideNotifBanner = () => notifBanner.classList.add("hidden");
+const hideNotifBanner = () => { clearTimeout(notifHideTimer); notifBanner.classList.add("hidden"); };
+notifBtn.addEventListener("click", () => notifAction && notifAction());
+
+function httpsHelp() {
+  alert(
+    "Los celulares solo permiten notificaciones y llamadas en páginas seguras (https://).\n\n" +
+    "OPCIÓN 1 (cualquier celular): en la PC, en otra terminal, corre:\n" +
+    "cloudflared tunnel --url http://localhost:3001\n" +
+    "y abre en el celular la dirección https://…trycloudflare.com que aparece.\n\n" +
+    "OPCIÓN 2 (solo Android con Chrome): abre chrome://flags/#unsafely-treat-insecure-origin-as-secure , " +
+    "escribe " + location.origin + " , actívalo y reinicia Chrome."
+  );
+}
 
 function b64ToUint8(b64) {
   const pad = "=".repeat((4 - (b64.length % 4)) % 4);
@@ -663,52 +745,63 @@ async function ensurePushSubscription() {
   }
 }
 
-async function setupNotifications() {
-  hideNotifBanner();
-  if (isIOS && !isStandalone) {
-    return showNotifBanner("En iPhone: toca Compartir → «Añadir a pantalla de inicio» y abre Meliox desde ese ícono para recibir notificaciones.", false);
-  }
-  if (!window.isSecureContext) {
-    // Con http://192.168... el navegador no permite notificaciones: lo avisamos solo la primera vez
-    try {
-      if (localStorage.getItem("meliox_https_hint")) return;
-      localStorage.setItem("meliox_https_hint", "1");
-    } catch {}
-    return showNotifBanner("Para recibir notificaciones en el celular, Meliox debe abrirse con una dirección https://.", false);
-  }
-  if (!pushSupported) return;
-  try { swReg = await navigator.serviceWorker.register("/sw.js"); } catch { return; }
-
-  if (Notification.permission === "granted") {
-    if ((await ensurePushSubscription()) === "no-server") {
-      showNotifBanner("El servidor no tiene las notificaciones instaladas (falta npm install web-push).", false);
-    }
-    return;
-  }
-  if (Notification.permission === "denied") {
-    return showNotifBanner("Las notificaciones están bloqueadas para este sitio. Actívalas en los ajustes del navegador.", false);
-  }
-  showNotifBanner("Activa las notificaciones para enterarte cuando te escriban.", true);
+async function testPush() {
+  try {
+    await api("/api/push/test", { method: "POST" });
+    toast("En 5 segundos te llega una prueba. Minimiza Meliox para verla.");
+  } catch (ex) { toast(ex.message); }
 }
 
-notifBtn.addEventListener("click", async () => {
-  const perm = await Notification.requestPermission();
-  if (perm !== "granted") {
-    return showNotifBanner("No diste permiso. Puedes activarlo después desde los ajustes del navegador.", false);
-  }
+// Intenta suscribir este dispositivo y muestra el resultado en el aviso
+async function activatePush(announce) {
   const r = await ensurePushSubscription();
-  if (r === "ok") { hideNotifBanner(); toast("Notificaciones activadas."); }
-  else if (r === "no-server") showNotifBanner("El servidor no tiene las notificaciones instaladas (falta npm install web-push).", false);
-  else showNotifBanner("No se pudieron activar. Toca Activar para intentar de nuevo.", true);
-});
+  if (r === "ok") {
+    if (announce) {
+      showNotifBanner("Notificaciones activadas ✓", { label: "Probar", action: testPush });
+      notifHideTimer = setTimeout(hideNotifBanner, 15000);
+    } else hideNotifBanner();
+  } else if (r === "no-server") {
+    showNotifBanner("El servidor no tiene las notificaciones instaladas (falta correr: npm install web-push).", null);
+  } else {
+    showNotifBanner("No se pudieron activar las notificaciones en este dispositivo.", { label: "Reintentar", action: () => activatePush(true) });
+  }
+}
+
+async function setupNotifications() {
+  hideNotifBanner();
+  if (!window.isSecureContext) {
+    return showNotifBanner("Sin https:// el celular no permite notificaciones ni llamadas.", { label: "Ayuda", action: httpsHelp });
+  }
+  if (isIOS && !isStandalone) {
+    return showNotifBanner("En iPhone: toca Compartir → «Añadir a pantalla de inicio» y abre Meliox desde ese ícono.", null);
+  }
+  if (!pushSupported) {
+    return showNotifBanner("Este navegador no soporta notificaciones push.", null);
+  }
+  try { swReg = await navigator.serviceWorker.register("/sw.js"); }
+  catch { return showNotifBanner("No se pudo iniciar el servicio de notificaciones.", { label: "Reintentar", action: setupNotifications }); }
+
+  if (Notification.permission === "granted") return activatePush(false);
+  if (Notification.permission === "denied") {
+    return showNotifBanner("Las notificaciones están bloqueadas. Actívalas en los ajustes del navegador (candado junto a la dirección).", null);
+  }
+  showNotifBanner("Activa las notificaciones para enterarte de mensajes y llamadas.", {
+    label: "Activar",
+    action: async () => {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") return showNotifBanner("No diste permiso. Puedes activarlo desde los ajustes del navegador.", null);
+      activatePush(true);
+    },
+  });
+}
 
 // Respaldo sin push: aviso del navegador cuando la pestaña está en segundo plano
-function notifyInPage(from) {
+function notifyInPage(from, text, tag) {
   if (pushActive || !("Notification" in window) || Notification.permission !== "granted") return;
   const f = friends.find((x) => x.phone === from);
-  if (!f || !f.last || f.last.from !== from) return;
+  if (!f) return;
   try {
-    const n = new Notification(f.name, { body: f.last.text, icon: f.photo, tag: "chat-" + from });
+    const n = new Notification(f.name, { body: text, icon: f.photo, tag: tag || "chat-" + from });
     n.onclick = () => { window.focus(); openChat(from); n.close(); };
   } catch {}
 }
@@ -720,6 +813,245 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+// ---------- Llamadas y videollamadas (WebRTC) ----------
+// Nota: dentro de tu casa funciona con STUN. Entre redes distintas (datos móviles) puede
+// fallar en algunas conexiones: ahí haría falta un servidor TURN.
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+const RING_TIMEOUT = 45000;
+
+let call = null; // { id, peer, video, role, pc, stream, cands, offer, timer, tick, startedAt }
+const callEl = $("#call");
+const remoteVideo = $("#remote-video");
+const localVideo = $("#local-video");
+
+const callSignal = (to, type, extra = {}) =>
+  api("/api/call/signal", { method: "POST", body: { to, type, ...extra } }).catch(() => {});
+
+function setCallUI(state, status) {
+  callEl.classList.toggle("video", !!(call && call.video));
+  callEl.classList.toggle("incoming", state === "incoming");
+  callEl.classList.toggle("ringing", state === "incoming" || state === "calling");
+  callEl.classList.toggle("connected", state === "connected");
+  if (status !== undefined) $("#call-status").textContent = status;
+}
+
+function showCall() {
+  const f = friends.find((x) => x.phone === call.peer);
+  $("#call-photo").src = f ? f.photo : "";
+  $("#call-name").textContent = f ? f.name : "+57 " + call.peer;
+  $("#call-mute").classList.remove("off");
+  $("#call-cam").classList.remove("off");
+  callEl.classList.remove("hidden");
+}
+
+async function getMedia(video) {
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Las llamadas necesitan https://. Toca «Ayuda» en el aviso verde.");
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: video ? { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } : false,
+    });
+  } catch (ex) {
+    if (ex.name === "NotAllowedError") throw new Error("Debes permitir el micrófono" + (video ? " y la cámara" : "") + ".");
+    if (ex.name === "NotFoundError") throw new Error("No se encontró " + (video ? "cámara o " : "") + "micrófono.");
+    throw new Error("No se pudo acceder al micrófono" + (video ? " o la cámara." : "."));
+  }
+}
+
+function makePeer() {
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const c = call;
+  pc.onicecandidate = (e) => {
+    if (e.candidate) callSignal(c.peer, "ice", { id: c.id, data: e.candidate.toJSON() });
+  };
+  pc.ontrack = (e) => {
+    remoteVideo.srcObject = e.streams[0];
+    remoteVideo.play().catch(() => {});
+  };
+  pc.onconnectionstatechange = () => {
+    if (call !== c) return;
+    if (pc.connectionState === "connected") onConnected();
+    else if (pc.connectionState === "failed") endCall("Se perdió la conexión", true);
+  };
+  c.pc = pc;
+  for (const t of c.stream.getTracks()) pc.addTrack(t, c.stream);
+  if (c.video) { localVideo.srcObject = c.stream; localVideo.play().catch(() => {}); }
+  return pc;
+}
+
+function onConnected() {
+  if (!call || call.startedAt) return;
+  clearTimeout(call.timer);
+  stopRing();
+  call.startedAt = Date.now();
+  setCallUI("connected", "00:00");
+  call.tick = setInterval(() => {
+    const s = Math.floor((Date.now() - call.startedAt) / 1000);
+    $("#call-status").textContent = String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+  }, 1000);
+}
+
+async function flushCandidates() {
+  const list = call.cands.splice(0);
+  for (const c of list) { try { await call.pc.addIceCandidate(c); } catch {} }
+}
+
+async function startCall(video) {
+  if (!current || !me) return;
+  if (call) return toast("Ya estás en una llamada.");
+  const peer = current;
+  let stream;
+  try { stream = await getMedia(video); } catch (ex) { return toast(ex.message); }
+  call = { id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()), peer, video, role: "caller", stream, cands: [], answered: false };
+  showCall();
+  setCallUI("calling", video ? "Videollamando…" : "Llamando…");
+  startRing("out");
+  const c = call;
+  try {
+    const pc = makePeer();
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await callSignal(peer, "offer", { id: c.id, video, data: { type: offer.type, sdp: offer.sdp } });
+    c.timer = setTimeout(() => { if (call === c && !c.startedAt) endCall("No contestó", true); }, RING_TIMEOUT);
+  } catch (ex) {
+    endCall("No se pudo iniciar la llamada", false);
+  }
+}
+
+function incomingCall(s) {
+  const f = friends.find((x) => x.phone === s.from);
+  if (!f) return; // solo amigos
+  if (s.age > RING_TIMEOUT) return; // ya expiró
+  call = { id: s.id, peer: s.from, video: !!s.video, role: "callee", cands: [], offer: s.data };
+  showCall();
+  setCallUI("incoming", s.video ? "Videollamada entrante" : "Llamada entrante");
+  startRing("in");
+  const c = call;
+  c.timer = setTimeout(() => { if (call === c && !c.startedAt) endCall("Llamada perdida", false); }, Math.max(1000, RING_TIMEOUT - (s.age || 0)));
+  if (document.hidden) {
+    notifyInPage(s.from, s.video ? "🎥 Videollamada entrante" : "📞 Llamada entrante", "call-" + s.from);
+  }
+}
+
+async function acceptCall() {
+  const c = call;
+  if (!c || c.role !== "callee" || c.pc) return;
+  try {
+    c.stream = await getMedia(c.video);
+  } catch (ex) {
+    toast(ex.message);
+    return endCall("", true, "reject");
+  }
+  if (call !== c) { c.stream.getTracks().forEach((t) => t.stop()); return; }
+  stopRing();
+  clearTimeout(c.timer);
+  setCallUI("calling", "Conectando…");
+  try {
+    const pc = makePeer();
+    await pc.setRemoteDescription(c.offer);
+    await flushCandidates();
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await callSignal(c.peer, "answer", { id: c.id, data: { type: answer.type, sdp: answer.sdp } });
+  } catch (ex) {
+    console.warn("Llamada:", ex);
+    endCall("No se pudo conectar", true);
+  }
+}
+
+// reason: texto que se muestra un momento; notify: avisar al otro; type: end | reject
+function endCall(reason, notify, type = "end") {
+  const c = call;
+  if (!c) return;
+  call = null;
+  clearTimeout(c.timer);
+  clearInterval(c.tick);
+  stopRing();
+  if (notify) {
+    callSignal(c.peer, type, { id: c.id, missed: c.role === "caller" && !c.startedAt });
+  }
+  try { c.pc && c.pc.close(); } catch {}
+  if (c.stream) c.stream.getTracks().forEach((t) => t.stop());
+  remoteVideo.srcObject = null;
+  localVideo.srcObject = null;
+  if (reason) {
+    $("#call-status").textContent = reason;
+    callEl.classList.remove("incoming", "ringing");
+    setTimeout(() => { if (!call) callEl.classList.add("hidden"); }, 1400);
+  } else {
+    callEl.classList.add("hidden");
+  }
+  callEl.classList.remove("connected", "video");
+}
+
+async function handleSignal(s) {
+  if (s.type === "offer") {
+    if (call) return callSignal(s.from, "busy", { id: s.id }); // ya estoy en una llamada
+    return incomingCall(s);
+  }
+  if (!call || call.id !== s.id) return;
+  if (s.type === "answer" && call.role === "caller" && call.pc && !call.answered) {
+    call.answered = true;
+    stopRing();
+    setCallUI("calling", "Conectando…");
+    try {
+      await call.pc.setRemoteDescription(s.data);
+      await flushCandidates();
+    } catch (ex) { console.warn("Llamada:", ex); }
+  } else if (s.type === "ice") {
+    if (call.pc && call.pc.remoteDescription) { try { await call.pc.addIceCandidate(s.data); } catch {} }
+    else call.cands.push(s.data);
+  } else if (s.type === "end") {
+    endCall(call.startedAt ? "Llamada finalizada" : "Llamada perdida", false);
+  } else if (s.type === "reject") {
+    endCall("Rechazó la llamada", false);
+  } else if (s.type === "busy") {
+    endCall("Está en otra llamada", false);
+  }
+}
+
+let draining = false;
+async function drainSignals() {
+  if (draining || !token || !me) return;
+  draining = true;
+  try {
+    const list = await api("/api/signals");
+    for (const s of list) await handleSignal(s);
+  } catch {}
+  draining = false;
+}
+// Revisa llamadas entrantes cada 2 s (funciona aunque el tiempo real esté bloqueado)
+setInterval(() => { if (!document.hidden || call) drainSignals(); }, 2000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) drainSignals(); });
+
+$("#btn-voice").addEventListener("click", () => startCall(false));
+$("#btn-video").addEventListener("click", () => startCall(true));
+$("#call-accept").addEventListener("click", acceptCall);
+$("#call-end").addEventListener("click", () => {
+  if (!call) return;
+  if (call.role === "callee" && !call.pc) endCall("", true, "reject");
+  else endCall("Llamada finalizada", true);
+});
+$("#call-mute").addEventListener("click", (e) => {
+  if (!call || !call.stream) return;
+  const t = call.stream.getAudioTracks()[0];
+  if (!t) return;
+  t.enabled = !t.enabled;
+  e.currentTarget.classList.toggle("off", !t.enabled);
+});
+$("#call-cam").addEventListener("click", (e) => {
+  if (!call || !call.stream) return;
+  const t = call.stream.getVideoTracks()[0];
+  if (!t) return;
+  t.enabled = !t.enabled;
+  e.currentTarget.classList.toggle("off", !t.enabled);
+});
+
 // ---------- Tiempo real ----------
 function connect() {
   if (es) es.close();
@@ -729,8 +1061,14 @@ function connect() {
     const watching = current === from && !document.hidden;
     if (current === from) await loadMessages(false);
     else await refreshMe();
-    if (!watching) notifyInPage(from);
+    if (!watching) {
+      playMsgSound();
+      blinkTitle();
+      const f = friends.find((x) => x.phone === from);
+      if (document.hidden && f && f.last && f.last.from === from) notifyInPage(from, f.last.text);
+    }
   });
+  es.addEventListener("signal", () => drainSignals());
   es.addEventListener("read", (e) => {
     const { by } = JSON.parse(e.data);
     if (current === by) loadMessages(false);
@@ -785,6 +1123,7 @@ async function dropPush(oldToken) {
 }
 
 function logout() {
+  if (call) endCall("", true);
   if (es) es.close();
   es = null;
   const oldToken = token;
@@ -793,6 +1132,8 @@ function logout() {
   pushActive = false;
   if (hadPush && oldToken) dropPush(oldToken);
   hideNotifBanner();
+  baseTitle = "Meliox";
+  stopBlink();
   document.title = "Meliox";
   localStorage.removeItem("meliox_token");
   $("#login-pass").value = "";
