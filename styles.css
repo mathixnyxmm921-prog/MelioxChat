@@ -263,6 +263,37 @@ input:focus { border-color: var(--accent-2); }
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
+/* ---------- Llamadas ---------- */
+.call { position: fixed; inset: 0; z-index: 40; background: radial-gradient(800px 600px at 50% 0%, #12323a, #0a1014 70%); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.call video { position: absolute; background: #000; }
+#remote-video { inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; }
+.call.video.connected #remote-video { display: block; }
+#local-video { right: 16px; bottom: 120px; width: 110px; height: 150px; object-fit: cover; border-radius: 14px; border: 2px solid rgba(255, 255, 255, 0.25); transform: scaleX(-1); display: none; z-index: 2; }
+.call.video #local-video { display: block; }
+.call-info { position: relative; z-index: 2; text-align: center; padding: 0 20px; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6); }
+.call-avatar { width: 140px; height: 140px; border-radius: 50%; object-fit: cover; border: 3px solid var(--accent); box-shadow: 0 0 0 10px rgba(31, 216, 164, 0.12); }
+.call.ringing .call-avatar { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 22px rgba(31, 216, 164, 0.04); } }
+.call-info h2 { margin: 18px 0 4px; font-size: 1.6rem; }
+.call-info p { margin: 0; color: var(--muted); }
+.call.video.connected .call-info { position: absolute; top: 18px; left: 0; right: 0; }
+.call.video.connected .call-avatar { display: none; }
+.call.video.connected .call-info h2 { margin: 0; font-size: 1.1rem; }
+.call.video.connected .call-info p { color: #fff; }
+.call-actions { position: absolute; bottom: 36px; left: 0; right: 0; z-index: 3; display: flex; justify-content: center; gap: 22px; }
+.call-btn { width: 64px; height: 64px; border: none; border-radius: 50%; background: rgba(255, 255, 255, 0.16); backdrop-filter: blur(6px); color: #fff; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: transform 0.1s, background 0.15s; }
+.call-btn:active { transform: scale(0.92); }
+.call-btn.end { background: var(--danger); }
+.call-btn.accept { background: var(--accent-2); }
+.call-btn.off { background: #fff; color: #111; }
+.call-btn .slash { display: none; }
+.call-btn.off .slash { display: block; }
+#call-mute, #call-cam, #call-accept { display: none; }
+.call.connected #call-mute { display: flex; }
+.call.video.connected #call-cam { display: flex; }
+.call.incoming #call-accept { display: flex; }
+.call.incoming #call-end { background: var(--danger); }
+
 /* ---------- Celular ---------- */
 @media (max-width: 760px) {
   body { padding: 0; }
