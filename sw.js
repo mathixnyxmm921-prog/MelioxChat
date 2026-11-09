@@ -1,46 +1,54 @@
-"use strict";
+// Service worker de Meliox: recibe las notificaciones push aunque la app esté cerrada.
+
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
 
 self.addEventListener("push", (event) => {
-  let data = { title: "Meliox", body: "Nuevo mensaje", phone: "" };
+  let data = {};
   try {
-    if (event.data) {
-      data = event.data.json();
-    }
-  } catch (e) {
-    data.body = event.data.text();
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = { body: event.data ? event.data.text() : "" };
   }
 
-  const options = {
-    body: data.body,
-    icon: "/icon-192.png",
-    badge: "/icon-192.png",
-    tag: data.tag || "meliox-notif",
-    data: { phone: data.phone }
-  };
-
   event.waitUntil(
-    self.registration.showNotification(data.title || "Meliox", options)
+    (async () => {
+      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      // Si ya estás mirando Meliox, no hace falta avisarte
+      if (wins.some((w) => w.visibilityState === "visible" && w.focused)) return;
+
+      const isCall = data.type === "call";
+      await self.registration.showNotification(data.title || "Meliox", {
+        body: data.body || "Tienes un mensaje nuevo",
+        icon: "/icon-192.png",
+        badge: "/icon-192.png",
+        tag: data.tag || "meliox",
+        renotify: true,
+        // Las llamadas se quedan en pantalla y vibran como un timbre
+        requireInteraction: isCall,
+        vibrate: isCall ? [400, 200, 400, 200, 400, 200, 400] : [150, 80, 150],
+        data: { phone: data.phone || null },
+      });
+    })()
   );
 });
 
+// Al tocar la notificación: abre Meliox directo en el chat de quien escribió
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const phone = event.notification.data && event.notification.data.phone;
 
   event.waitUntil(
-    clients.matchAll({ type: "window", includeUncontrolled: true }).then((clientList) => {
-      for (const client of clientList) {
-        if ("focus" in client) {
-          client.focus();
-          if (phone) {
-            client.postMessage({ type: "open-chat", phone: phone });
-          }
+    (async () => {
+      const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const w of wins) {
+        if ("focus" in w) {
+          await w.focus();
+          if (phone) w.postMessage({ type: "open-chat", phone });
           return;
         }
       }
-      if (clients.openWindow) {
-        return clients.openWindow(phone ? `/?chat=${phone}` : "/");
-      }
-    })
+      await self.clients.openWindow(phone ? "/?chat=" + phone : "/");
+    })()
   );
 });
