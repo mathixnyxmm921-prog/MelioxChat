@@ -99,16 +99,25 @@ const MANIFEST = {
 // ---------- Base de datos (archivo JSON) ----------
 let db = { users: {}, requests: [], messages: [], sessions: {}, vapid: null };
 try {
-  db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, "utf8")) };
-} catch {}
+  const fileData = fs.readFileSync(DB_FILE, "utf8");
+  if (fileData) {
+    db = { ...db, ...JSON.parse(fileData) };
+  }
+} catch (e) {
+  console.log("Creando nueva base de datos o usando estructura por defecto.");
+}
 
 let saveTimer = null;
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 200);
+  saveTimer = setTimeout(() => {
+    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (err) => {
+      if (err) console.error("Error al guardar la base de datos:", err);
+    });
+  }, 200);
 }
 
-// ---------- Notificaciones push (nativas: NO hay que instalar nada) ----------
+// ---------- Notificaciones push ----------
 const b64u = (buf) => Buffer.from(buf).toString("base64url");
 const unb64u = (str) => Buffer.from(str, "base64url");
 
@@ -202,7 +211,6 @@ function sendWebPush(sub, payload, { ttl = 86400, urgency = "high" } = {}) {
   });
 }
 
-// ---------- Utilidades ----------
 const clients = new Map();
 
 function push(phone, event, data = {}) {
@@ -230,8 +238,6 @@ async function sendPush(to, from, text, extra = {}, opts = {}) {
       if (e.statusCode === 404 || e.statusCode === 410) {
         to.push = to.push.filter((s) => s.endpoint !== sub.endpoint);
         save();
-      } else {
-        console.error("push falló:", e.statusCode || "", e.message);
       }
     }
   }
@@ -259,7 +265,7 @@ function readBody(req) {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      // Ampliado a 5MB para soportar fotos de perfil en Base64 desde el celular
+      // Ampliado a 5MB seguros para evitar errores 413 con fotos de perfil grandes
       if (data.length > 5_000_000) {
         reject(Object.assign(new Error("Archivo demasiado grande"), { status: 413 }));
         req.destroy();
@@ -316,13 +322,12 @@ async function api(req, res, url, p) {
     if (n.length < 2 || n.length > 30) fail(400, "El nombre debe tener entre 2 y 30 letras.");
     if (!PHONE_RE.test(String(phone || ""))) fail(400, "El número debe empezar con 3 y tener exactamente 10 dígitos.");
     if (String(password || "").length < 6) fail(400, "La contraseña debe tener mínimo 6 caracteres.");
-    // Aumentado a 3.5 MB para permitir fotos de cámara móvil en el registro
-    if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 3_500_000) {
-      fail(400, "Foto no válida.");
+    if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 4_000_000) {
+      fail(400, "Foto no válida o demasiado pesada.");
     }
     if (db.users[phone]) fail(409, "Ese número ya está registrado.");
     const salt = crypto.randomBytes(16).toString("hex");
-    db.users[phone] = { phone, name: n, photo, salt, hash: hashPass(password, salt), friends: [] };
+    db.users[phone] = { phone, name: n, photo, salt, hash: hashPass(password, salt), friends: [], push: [] };
     const token = newSession(phone);
     save();
     return json(res, 200, { token, me: pub(db.users[phone]) });
@@ -331,7 +336,7 @@ async function api(req, res, url, p) {
   if (m === "POST" && p === "/api/login") {
     const { phone, password } = await readBody(req);
     const user = db.users[String(phone || "")];
-    if (!user) fail(400, "Número ou contraseña incorrectos.");
+    if (!user) fail(400, "Número o contraseña incorrectos.");
     const a = Buffer.from(hashPass(String(password || ""), user.salt), "hex");
     const b = Buffer.from(user.hash, "hex");
     if (!crypto.timingSafeEqual(a, b)) fail(400, "Número o contraseña incorrectos.");
@@ -416,11 +421,13 @@ async function api(req, res, url, p) {
     signals.set(to, q.slice(-60));
     push(to, "signal");
     const target = db.users[to];
-    if (type === "offer") {
-      sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
-        { type: "call", tag: "call-" + user.phone }, { ttl: 30 });
-    } else if (type === "end" && missed) {
-      sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
+    if (target) {
+      if (type === "offer") {
+        sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
+          { type: "call", tag: "call-" + user.phone }, { ttl: 30 });
+      } else if (type === "end" && missed) {
+        sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
+      }
     }
     return json(res, 200, { ok: true });
   }
@@ -434,8 +441,8 @@ async function api(req, res, url, p) {
       if (newName.length < 2 || newName.length > 30) fail(400, "El nombre debe tener entre 2 y 30 letras.");
     }
     if (photo !== undefined) {
-      if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 3_500_000) {
-        fail(400, "Foto no válida.");
+      if (typeof photo !== "string" || !photo.startsWith("data:image/") || photo.length > 4_000_000) {
+        fail(400, "Foto no válida o demasiado pesada.");
       }
       newPhoto = photo;
     }
@@ -463,8 +470,8 @@ async function api(req, res, url, p) {
     const reverse = db.requests.findIndex((r) => r.from === phone && r.to === user.phone);
     if (reverse >= 0) {
       db.requests.splice(reverse, 1);
-      user.friends.push(phone);
-      target.friends.push(user.phone);
+      if (!user.friends.includes(phone)) user.friends.push(phone);
+      if (!target.friends.includes(user.phone)) target.friends.push(user.phone);
       save();
       push(phone, "friends");
       return json(res, 200, { status: "accepted", name: target.name });
@@ -491,10 +498,11 @@ async function api(req, res, url, p) {
 
   if (m === "POST" && p === "/api/friends/remove") {
     const { phone } = await readBody(req);
-    if (!user.friends.includes(phone)) fail(404, "Esa persona no está en tus amigos.");
     user.friends = user.friends.filter((x) => x !== phone);
     const other = db.users[phone];
-    if (other) other.friends = other.friends.filter((x) => x !== user.phone);
+    if (other) {
+      other.friends = other.friends.filter((x) => x !== user.phone);
+    }
     db.requests = db.requests.filter(
       (r) => !((r.from === user.phone && r.to === phone) || (r.from === phone && r.to === user.phone))
     );
@@ -527,7 +535,9 @@ async function api(req, res, url, p) {
     db.messages.push(msg);
     save();
     push(to, "newmsg", { from: user.phone });
-    sendPush(db.users[to], user, t);
+    if (db.users[to]) {
+      sendPush(db.users[to], user, t);
+    }
     push(user.phone, "friends");
     return json(res, 200, msg);
   }
@@ -593,13 +603,10 @@ setInterval(() => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`\nMeliox listo en http://localhost:${PORT}`);
-  console.log("Notificaciones push: activas (sin instalar nada)");
+  console.log("Notificaciones push: activas");
   if (!vapid.fromEnv) {
-    console.log("Consejo (Render): para que las llaves de notificaciones no se pierdan al reiniciar, crea estas dos variables en Environment:");
-    console.log("  VAPID_PUBLIC_KEY  = " + vapid.publicKey);
-    console.log("  VAPID_PRIVATE_KEY = " + vapid.privB64);
+    console.log("Variables VAPID generadas automáticamente.");
   }
-  console.log("");
 });
 
 module.exports = { encryptPayload, vapidHeader, initVapid };
