@@ -3,6 +3,7 @@
 // Uso:  node server.cjs   →  http://localhost:3001
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -108,16 +109,101 @@ function save() {
   saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 200);
 }
 
-// ---------- Notificaciones push (opcional: npm install web-push) ----------
-let webpush = null;
-try { webpush = require("web-push"); } catch {}
-if (webpush) {
-  if (!db.vapid) { db.vapid = webpush.generateVAPIDKeys(); save(); }
-  webpush.setVapidDetails(
-    process.env.VAPID_SUBJECT || "mailto:meliox@example.com",
-    db.vapid.publicKey,
-    db.vapid.privateKey
-  );
+// ---------- Notificaciones push (nativas: NO hay que instalar nada) ----------
+// Implementa Web Push (RFC 8030 + 8291 + VAPID 8292) con el módulo crypto de Node.
+const b64u = (buf) => Buffer.from(buf).toString("base64url");
+const unb64u = (str) => Buffer.from(str, "base64url");
+
+let vapid = null; // { publicKey: base64url (65 bytes), privateKey: KeyObject }
+function initVapid() {
+  // Si defines VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY (en Render: Environment) las llaves no se pierden al reiniciar.
+  let pubB64 = process.env.VAPID_PUBLIC_KEY;
+  let privB64 = process.env.VAPID_PRIVATE_KEY;
+  let fromEnv = !!(pubB64 && privB64);
+  if (!fromEnv && db.vapid && db.vapid.publicKey && db.vapid.privateKey) {
+    pubB64 = db.vapid.publicKey;
+    privB64 = db.vapid.privateKey;
+  }
+  if (!pubB64 || !privB64) {
+    const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const jwk = privateKey.export({ format: "jwk" });
+    pubB64 = b64u(Buffer.concat([Buffer.from([4]), unb64u(jwk.x), unb64u(jwk.y)]));
+    privB64 = jwk.d;
+    db.vapid = { publicKey: pubB64, privateKey: privB64 };
+    save();
+  }
+  const pubRaw = unb64u(pubB64);
+  const privateKey = crypto.createPrivateKey({
+    key: { kty: "EC", crv: "P-256", d: privB64, x: b64u(pubRaw.subarray(1, 33)), y: b64u(pubRaw.subarray(33, 65)) },
+    format: "jwk",
+  });
+  vapid = { publicKey: pubB64, privateKey, fromEnv, privB64 };
+}
+initVapid();
+
+function vapidHeader(endpoint) {
+  const head = b64u(JSON.stringify({ typ: "JWT", alg: "ES256" }));
+  const body = b64u(JSON.stringify({
+    aud: new URL(endpoint).origin,
+    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+    sub: process.env.VAPID_SUBJECT || process.env.RENDER_EXTERNAL_URL || "mailto:meliox@example.com",
+  }));
+  const sig = crypto.sign("sha256", Buffer.from(head + "." + body), { key: vapid.privateKey, dsaEncoding: "ieee-p1363" });
+  return `vapid t=${head}.${body}.${b64u(sig)}, k=${vapid.publicKey}`;
+}
+
+// Cifrado del mensaje (aes128gcm). `fixed` solo se usa en pruebas.
+function encryptPayload(sub, payload, fixed) {
+  const uaPub = unb64u(sub.keys.p256dh);
+  const auth = unb64u(sub.keys.auth);
+  const ecdh = (fixed && fixed.ecdh) || crypto.createECDH("prime256v1");
+  if (!fixed || !fixed.ecdh) ecdh.generateKeys();
+  const asPub = ecdh.getPublicKey();
+  const secret = ecdh.computeSecret(uaPub);
+  const salt = (fixed && fixed.salt) || crypto.randomBytes(16);
+  const keyInfo = Buffer.concat([Buffer.from("WebPush: info\0"), uaPub, asPub]);
+  const ikm = Buffer.from(crypto.hkdfSync("sha256", secret, auth, keyInfo, 32));
+  const cek = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: aes128gcm\0"), 16));
+  const nonce = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: nonce\0"), 12));
+  const cipher = crypto.createCipheriv("aes-128-gcm", cek, nonce);
+  const enc = Buffer.concat([cipher.update(Buffer.concat([Buffer.from(payload), Buffer.from([2])])), cipher.final(), cipher.getAuthTag()]);
+  const header = Buffer.alloc(21);
+  salt.copy(header, 0);
+  header.writeUInt32BE(4096, 16);
+  header[20] = asPub.length;
+  return Buffer.concat([header, asPub, enc]);
+}
+
+function sendWebPush(sub, payload, { ttl = 86400, urgency = "high" } = {}) {
+  return new Promise((resolve, reject) => {
+    let body, u;
+    try { body = encryptPayload(sub, payload); u = new URL(sub.endpoint); } catch (e) { return reject(e); }
+    const req = https.request({
+      method: "POST",
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      timeout: 15000,
+      headers: {
+        "Content-Encoding": "aes128gcm",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": body.length,
+        TTL: String(ttl),
+        Urgency: urgency,
+        Authorization: vapidHeader(sub.endpoint),
+      },
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve({ status: res.statusCode });
+        else reject(Object.assign(new Error(d.slice(0, 200) || "HTTP " + res.statusCode), { statusCode: res.statusCode }));
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("tiempo agotado")));
+    req.end(body);
+  });
 }
 
 // ---------- Utilidades ----------
@@ -129,9 +215,11 @@ function push(phone, event, data = {}) {
   }
 }
 
-// Avisa a los celulares/navegadores de `to` que `from` le escribió
+// Avisa a los celulares/navegadores de `to` que `from` le escribió.
+// Devuelve un resultado por dispositivo: [{ ok, status, error }]
 async function sendPush(to, from, text, extra = {}, opts = {}) {
-  if (!webpush || !to || !to.push || !to.push.length) return;
+  const results = [];
+  if (!to || !to.push || !to.push.length) return results;
   const payload = JSON.stringify({
     title: from.name,
     body: text.length > 140 ? text.slice(0, 137) + "…" : text,
@@ -141,17 +229,20 @@ async function sendPush(to, from, text, extra = {}, opts = {}) {
   });
   for (const sub of [...to.push]) {
     try {
-      await webpush.sendNotification(sub, payload, { TTL: 86400, urgency: "high", ...opts });
+      const r = await sendWebPush(sub, payload, opts);
+      results.push({ ok: true, status: r.status });
     } catch (e) {
+      results.push({ ok: false, status: e.statusCode, error: e.message });
       if (e.statusCode === 404 || e.statusCode === 410) {
         // Ese dispositivo ya no existe: lo quito de la lista
         to.push = to.push.filter((s) => s.endpoint !== sub.endpoint);
         save();
       } else {
-        console.error("push:", e.statusCode || e.message);
+        console.error("push falló:", e.statusCode || "", e.message);
       }
     }
   }
+  return results;
 }
 
 // Señales de llamadas (WebRTC): se guardan unos segundos hasta que el destinatario las recoge
@@ -274,11 +365,10 @@ async function api(req, res, url, p) {
   }
 
   if (m === "GET" && p === "/api/push/key") {
-    return json(res, 200, { key: webpush ? db.vapid.publicKey : null });
+    return json(res, 200, { key: vapid.publicKey });
   }
 
   if (m === "POST" && p === "/api/push/subscribe") {
-    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     const { subscription: s } = await readBody(req);
     const ok =
       s && typeof s.endpoint === "string" && s.endpoint.startsWith("https://") && s.endpoint.length < 1000 &&
@@ -304,11 +394,16 @@ async function api(req, res, url, p) {
   }
 
   if (m === "POST" && p === "/api/push/test") {
-    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     if (!user.push || !user.push.length) fail(400, "Este dispositivo todavía no está suscrito.");
     // Espera 5 s para que alcances a minimizar la app y veas la notificación
-    setTimeout(() => sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" }), 5000);
-    return json(res, 200, { ok: true });
+    await new Promise((r) => setTimeout(r, 5000));
+    const results = await sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" });
+    const good = results.filter((r) => r.ok).length;
+    if (!good) {
+      const bad = results[0] || {};
+      fail(502, "El servicio de notificaciones del celular rechazó el envío (" + (bad.status || bad.error || "sin respuesta") + ").");
+    }
+    return json(res, 200, { ok: true, sent: good });
   }
 
   if (m === "GET" && p === "/api/signals") {
@@ -332,7 +427,7 @@ async function api(req, res, url, p) {
     if (type === "offer") {
       // Suena en el celular aunque la app esté cerrada
       sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
-        { type: "call", tag: "call-" + user.phone }, { TTL: 30 });
+        { type: "call", tag: "call-" + user.phone }, { ttl: 30 });
     } else if (type === "end" && missed) {
       sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
     }
@@ -478,6 +573,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (p === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+
   if (p === "/manifest.webmanifest") {
     res.writeHead(200, { "Content-Type": "application/manifest+json; charset=utf-8" });
     return res.end(JSON.stringify(MANIFEST));
@@ -505,11 +605,12 @@ setInterval(() => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`\nMeliox listo en http://localhost:${PORT}`);
-  console.log(
-    webpush
-      ? "Notificaciones push: activas"
-      : "Notificaciones push: DESACTIVADAS (falta instalar. Corre:  npm install web-push)"
-  );
+  console.log("Notificaciones push: activas (sin instalar nada)");
+  if (!vapid.fromEnv) {
+    console.log("Consejo (Render): para que las llaves de notificaciones no se pierdan al reiniciar, crea estas dos variables en Environment:");
+    console.log("  VAPID_PUBLIC_KEY  = " + vapid.publicKey);
+    console.log("  VAPID_PRIVATE_KEY = " + vapid.privB64);
+  }
   for (const list of Object.values(os.networkInterfaces())) {
     for (const i of list || []) {
       if (i.family === "IPv4" && !i.internal) console.log(`Desde otro celular en tu Wi-Fi: http://${i.address}:${PORT}`);
@@ -517,3 +618,5 @@ server.listen(PORT, "0.0.0.0", () => {
   }
   console.log("");
 });
+
+module.exports = { encryptPayload, vapidHeader, initVapid };
