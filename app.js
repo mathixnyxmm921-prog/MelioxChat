@@ -1,10 +1,14 @@
 // ===================== Meliox =====================
 const $ = (s) => document.querySelector(s);
 
+// Configuración de la API adaptada para Render y entorno local:
+// Si la aplicación se carga desde Render (ej: melioxchat.onrender.com), usa rutas relativas ("").
+// Si entras desde tu red local o localhost, mantiene la conexión al puerto 3001.
 const API = location.hostname.includes("onrender.com")
   ? ""
   : (location.port === "3001" ? "" : `http://${location.hostname}:3001`);
 
+// ---------- Número colombiano: empieza con 3 y EXACTAMENTE 10 dígitos ----------
 const PHONE_REGEX = /^3\d{9}$/;
 
 function phoneError(value) {
@@ -17,6 +21,7 @@ function phoneError(value) {
 }
 const cleanPhoneInput = (input) => (input.value = input.value.replace(/\D/g, "").slice(0, 10));
 
+// ---------- Utilidades ----------
 function h(tag, props = {}, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
@@ -54,17 +59,18 @@ function listTime(ts) {
   return new Date(ts).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" });
 }
 
+// ---------- Estado ----------
 let token = localStorage.getItem("meliox_token");
 let me = null;
 let friends = [];
 let incoming = [];
-let current = null;
+let current = null; // teléfono del chat abierto
 let msgs = [];
 let es = null;
-let longPressed = false;
+let longPressed = false; // para "mantener presionado" en el celular
 let longTimer = null;
-let swReg = null;
-let pushActive = false;
+let swReg = null;        // service worker (notificaciones push)
+let pushActive = false;  // este dispositivo ya recibe notificaciones push
 
 async function api(path, opts = {}) {
   let res;
@@ -75,7 +81,7 @@ async function api(path, opts = {}) {
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
   } catch {
-    throw new Error("No se pudo conectar con el servidor.");
+    throw new Error("No se pudo conectar con el servidor. ¿Está corriendo node server.cjs?");
   }
   let data = {};
   try { data = await res.json(); } catch {}
@@ -86,6 +92,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// ---------- Vistas ----------
 const views = { login: $("#view-login"), register: $("#view-register"), home: $("#view-home") };
 function show(name) {
   Object.values(views).forEach((v) => v.classList.add("hidden"));
@@ -94,6 +101,7 @@ function show(name) {
 $("#go-register").addEventListener("click", (e) => { e.preventDefault(); show("register"); });
 $("#go-login").addEventListener("click", (e) => { e.preventDefault(); show("login"); });
 
+// ---------- Editor de foto (mover + zoom), reutilizable ----------
 const SIZE = 280;
 
 function createCropper({ canvas, zoomInput, zoomWrap, empty }) {
@@ -224,6 +232,7 @@ $("#photo-input").addEventListener("change", async (e) => {
   $("#reg-error").textContent = ok ? "" : "Elige un archivo de imagen válido.";
 });
 
+// ---------- Registro y login ----------
 const regPhone = $("#reg-phone");
 const counter = $("#phone-counter");
 regPhone.addEventListener("input", () => {
@@ -281,6 +290,7 @@ $("#form-login").addEventListener("submit", async (e) => {
   }
 });
 
+// ---------- App ----------
 async function refreshMe() {
   const data = await api("/api/me");
   me = data.me;
@@ -294,6 +304,7 @@ async function refreshMe() {
   renderSidebar();
   updatePeerHeader();
 
+  // Contador de mensajes sin leer en la pestaña y en el ícono de la app
   const unreadTotal = friends.reduce((a, f) => a + (f.unread || 0), 0);
   baseTitle = unreadTotal ? `(${unreadTotal}) Meliox` : "Meliox";
   if (!blinkTimer) document.title = baseTitle;
@@ -391,6 +402,7 @@ async function respond(phone, accept) {
   } catch (ex) { toast(ex.message); }
 }
 
+// ---------- Chat ----------
 async function openChat(phone) {
   const f = friends.find((x) => x.phone === phone);
   if (!f) return;
@@ -463,6 +475,7 @@ function closeChat() {
 }
 $("#back").addEventListener("click", closeChat);
 
+// ---------- Eliminar amigo ----------
 const ctxMenu = $("#ctx-menu");
 const confirmModal = $("#confirm-modal");
 let ctxTarget = null;
@@ -508,6 +521,7 @@ $("#confirm-ok").addEventListener("click", async () => {
   }
 });
 
+// ---------- Agregar amigo ----------
 const modal = $("#modal");
 const addMsg = $("#add-msg");
 function openModal() {
@@ -541,6 +555,7 @@ $("#form-add").addEventListener("submit", async (e) => {
   }
 });
 
+// ---------- Editar mi perfil ----------
 const profileModal = $("#profile-modal");
 const profileMsg = $("#profile-msg");
 const profileCropper = createCropper({
@@ -599,6 +614,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { closeModal(); closeProfile(); closeCtx(); closeConfirm(); }
 });
 
+// ---------- Sonidos (sin archivos: se generan con el navegador) ----------
 let audioCtx = null;
 function unlockAudio() {
   try {
@@ -643,6 +659,7 @@ function stopRing() {
   vibrate(0);
 }
 
+// Título parpadeante cuando llega un mensaje y la pestaña está en segundo plano
 let baseTitle = "Meliox";
 let blinkTimer = null;
 function blinkTitle() {
@@ -661,6 +678,7 @@ function stopBlink() {
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) stopBlink(); });
 
+// ---------- Notificaciones (push en el celular, como WhatsApp) ----------
 const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
 const isStandalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 const pushSupported =
@@ -684,7 +702,14 @@ const hideNotifBanner = () => { clearTimeout(notifHideTimer); notifBanner.classL
 notifBtn.addEventListener("click", () => notifAction && notifAction());
 
 function httpsHelp() {
-  alert("Los celulares solo permiten notificaciones push seguras bajo https://.");
+  alert(
+    "Los celulares solo permiten notificaciones y llamadas en páginas seguras (https://).\n\n" +
+    "OPCIÓN 1 (cualquier celular): en la PC, en otra terminal, corre:\n" +
+    "cloudflared tunnel --url http://localhost:3001\n" +
+    "y abre en el celular la dirección https://…trycloudflare.com que aparece.\n\n" +
+    "OPCIÓN 2 (solo Android con Chrome): abre chrome://flags/#unsafely-treat-insecure-origin-as-secure , " +
+    "escribe " + location.origin + " , actívalo y reinicia Chrome."
+  );
 }
 
 function b64ToUint8(b64) {
@@ -693,6 +718,7 @@ function b64ToUint8(b64) {
   return Uint8Array.from(raw, (c) => c.charCodeAt(0));
 }
 
+// Devuelve "ok", "no-server" (el servidor no tiene web-push) o "error"
 async function ensurePushSubscription() {
   if (!swReg || !token) return "error";
   try {
@@ -701,6 +727,7 @@ async function ensurePushSubscription() {
     const reg = await navigator.serviceWorker.ready;
     let sub = await reg.pushManager.getSubscription();
     if (sub) {
+      // Si el servidor cambió de llave, la suscripción vieja ya no sirve
       const cur = new Uint8Array(sub.options.applicationServerKey || []);
       const want = b64ToUint8(key);
       if (cur.length !== want.length || cur.some((v, i) => v !== want[i])) {
@@ -713,6 +740,7 @@ async function ensurePushSubscription() {
     pushActive = true;
     return "ok";
   } catch (ex) {
+    console.warn("Push:", ex);
     return "error";
   }
 }
@@ -721,10 +749,11 @@ async function testPush() {
   toast("En 5 segundos te llega una prueba. Minimiza Meliox para verla.");
   try {
     await api("/api/push/test", { method: "POST" });
-    toast("Prueba enviada ✓");
+    toast("Prueba enviada ✓ Si no la ves, revisa los permisos de notificaciones del celular.");
   } catch (ex) { toast(ex.message); }
 }
 
+// Intenta suscribir este dispositivo y muestra el resultado en el aviso
 async function activatePush(announce) {
   const r = await ensurePushSubscription();
   if (r === "ok") {
@@ -732,41 +761,69 @@ async function activatePush(announce) {
       showNotifBanner("Notificaciones activadas ✓", { label: "Probar", action: testPush });
       notifHideTimer = setTimeout(hideNotifBanner, 15000);
     } else hideNotifBanner();
+  } else if (r === "no-server") {
+    showNotifBanner("El servidor no tiene las notificaciones instaladas (falta correr: npm install web-push).", null);
+  } else {
+    showNotifBanner("No se pudieron activar las notificaciones en este dispositivo.", { label: "Reintentar", action: () => activatePush(true) });
   }
 }
 
 async function setupNotifications() {
   hideNotifBanner();
-  if (!window.isSecureContext || !pushSupported) return;
-  try {
-    swReg = await navigator.serviceWorker.register("/sw.js");
-  } catch (e) {
-    return;
+  if (!window.isSecureContext) {
+    return showNotifBanner("Sin https:// el celular no permite notificaciones ni llamadas.", { label: "Ayuda", action: httpsHelp });
   }
+  if (isIOS && !isStandalone) {
+    return showNotifBanner("En iPhone: toca Compartir → «Añadir a pantalla de inicio» y abre Meliox desde ese ícono.", null);
+  }
+  if (!pushSupported) {
+    return showNotifBanner("Este navegador no soporta notificaciones push.", null);
+  }
+  try { swReg = await navigator.serviceWorker.register("/sw.js"); }
+  catch { return showNotifBanner("No se pudo iniciar el servicio de notificaciones.", { label: "Reintentar", action: setupNotifications }); }
 
-  if (Notification.permission === "granted") {
-    activatePush(true);
-  } else if (Notification.permission !== "denied") {
-    const perm = await Notification.requestPermission();
-    if (perm === "granted") {
-      activatePush(true);
-    }
+  if (Notification.permission === "granted") return activatePush(true);
+  if (Notification.permission === "denied") {
+    return showNotifBanner("Las notificaciones están bloqueadas. Actívalas en los ajustes del navegador (candado junto a la dirección).", null);
   }
+  showNotifBanner("Activa las notificaciones para enterarte de mensajes y llamadas.", {
+    label: "Activar",
+    action: async () => {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") return showNotifBanner("No diste permiso. Puedes activarlo desde los ajustes del navegador.", null);
+      activatePush(true);
+    },
+  });
 }
 
+// Respaldo sin push: aviso del navegador cuando la pestaña está en segundo plano
+function notifyInPage(from, text, tag) {
+  if (pushActive || !("Notification" in window) || Notification.permission !== "granted") return;
+  const f = friends.find((x) => x.phone === from);
+  if (!f) return;
+  try {
+    const n = new Notification(f.name, { body: text, icon: f.photo, tag: tag || "chat-" + from });
+    n.onclick = () => { window.focus(); openChat(from); n.close(); };
+  } catch {}
+}
+
+// Al tocar una notificación, el service worker nos pide abrir ese chat
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data && e.data.type === "open-chat" && me) openChat(e.data.phone);
   });
 }
 
+// ---------- Llamadas y videollamadas (WebRTC) ----------
+// Nota: dentro de tu casa funciona con STUN. Entre redes distintas (datos móviles) puede
+// fallar en algunas conexiones: ahí haría falta un servidor TURN.
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 const RING_TIMEOUT = 45000;
 
-let call = null;
+let call = null; // { id, peer, video, role, pc, stream, cands, offer, timer, tick, startedAt }
 const callEl = $("#call");
 const remoteVideo = $("#remote-video");
 const localVideo = $("#local-video");
@@ -793,7 +850,7 @@ function showCall() {
 
 async function getMedia(video) {
   if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    throw new Error("Las llamadas necesitan https://.");
+    throw new Error("Las llamadas necesitan https://. Toca «Ayuda» en el aviso verde.");
   }
   try {
     return await navigator.mediaDevices.getUserMedia({
@@ -801,7 +858,9 @@ async function getMedia(video) {
       video: video ? { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } } : false,
     });
   } catch (ex) {
-    throw new Error("No se pudo acceder al micrófono o cámara.");
+    if (ex.name === "NotAllowedError") throw new Error("Debes permitir el micrófono" + (video ? " y la cámara" : "") + ".");
+    if (ex.name === "NotFoundError") throw new Error("No se encontró " + (video ? "cámara o " : "") + "micrófono.");
+    throw new Error("No se pudo acceder al micrófono" + (video ? " o la cámara." : "."));
   }
 }
 
@@ -867,14 +926,17 @@ async function startCall(video) {
 
 function incomingCall(s) {
   const f = friends.find((x) => x.phone === s.from);
-  if (!f) return;
-  if (s.age > RING_TIMEOUT) return;
+  if (!f) return; // solo amigos
+  if (s.age > RING_TIMEOUT) return; // ya expiró
   call = { id: s.id, peer: s.from, video: !!s.video, role: "callee", cands: [], offer: s.data };
   showCall();
   setCallUI("incoming", s.video ? "Videollamada entrante" : "Llamada entrante");
   startRing("in");
   const c = call;
   c.timer = setTimeout(() => { if (call === c && !c.startedAt) endCall("Llamada perdida", false); }, Math.max(1000, RING_TIMEOUT - (s.age || 0)));
+  if (document.hidden) {
+    notifyInPage(s.from, s.video ? "🎥 Videollamada entrante" : "📞 Llamada entrante", "call-" + s.from);
+  }
 }
 
 async function acceptCall() {
@@ -898,10 +960,12 @@ async function acceptCall() {
     await pc.setLocalDescription(answer);
     await callSignal(c.peer, "answer", { id: c.id, data: { type: answer.type, sdp: answer.sdp } });
   } catch (ex) {
+    console.warn("Llamada:", ex);
     endCall("No se pudo conectar", true);
   }
 }
 
+// reason: texto que se muestra un momento; notify: avisar al otro; type: end | reject
 function endCall(reason, notify, type = "end") {
   const c = call;
   if (!c) return;
@@ -928,7 +992,7 @@ function endCall(reason, notify, type = "end") {
 
 async function handleSignal(s) {
   if (s.type === "offer") {
-    if (call) return callSignal(s.from, "busy", { id: s.id });
+    if (call) return callSignal(s.from, "busy", { id: s.id }); // ya estoy en una llamada
     return incomingCall(s);
   }
   if (!call || call.id !== s.id) return;
@@ -939,7 +1003,7 @@ async function handleSignal(s) {
     try {
       await call.pc.setRemoteDescription(s.data);
       await flushCandidates();
-    } catch (ex) {}
+    } catch (ex) { console.warn("Llamada:", ex); }
   } else if (s.type === "ice") {
     if (call.pc && call.pc.remoteDescription) { try { await call.pc.addIceCandidate(s.data); } catch {} }
     else call.cands.push(s.data);
@@ -962,6 +1026,7 @@ async function drainSignals() {
   } catch {}
   draining = false;
 }
+// Revisa llamadas entrantes cada 2 s (funciona aunque el tiempo real esté bloqueado)
 setInterval(() => { if (!document.hidden || call) drainSignals(); }, 2000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) drainSignals(); });
 
@@ -988,6 +1053,7 @@ $("#call-cam").addEventListener("click", (e) => {
   e.currentTarget.classList.toggle("off", !t.enabled);
 });
 
+// ---------- Tiempo real ----------
 function connect() {
   if (es) es.close();
   es = new EventSource(`${API}/api/events?token=${encodeURIComponent(token)}`);
@@ -999,6 +1065,8 @@ function connect() {
     if (!watching) {
       playMsgSound();
       blinkTitle();
+      const f = friends.find((x) => x.phone === from);
+      if (document.hidden && f && f.last && f.last.from === from) notifyInPage(from, f.last.text);
     }
   });
   es.addEventListener("signal", () => drainSignals());
@@ -1010,6 +1078,8 @@ function connect() {
   es.addEventListener("ready", () => { refreshMe(); if (current) loadMessages(false); });
 }
 
+// Red de seguridad: si algún intermediario (proxy, túnel) bloquea el tiempo real,
+// la app igual se actualiza cada 15 s y al volver a la pestaña.
 function syncNow() {
   if (!token || !me || document.hidden) return;
   if (current) loadMessages(false);
@@ -1018,12 +1088,14 @@ function syncNow() {
 setInterval(syncNow, 15000);
 document.addEventListener("visibilitychange", syncNow);
 
+// ---------- Inicio / salida ----------
 async function startApp() {
   try {
     await refreshMe();
     show("home");
     connect();
     setupNotifications();
+    // Si venimos de tocar una notificación (/?chat=3001234567), abrimos ese chat
     const wanted = new URLSearchParams(location.search).get("chat");
     if (wanted) {
       history.replaceState(null, "", location.pathname);
@@ -1035,6 +1107,8 @@ async function startApp() {
   }
 }
 
+// Quita este dispositivo de las notificaciones de la cuenta que se cierra
+// (usa fetch directo para no depender de api(), que llama a logout en un 401)
 async function dropPush(oldToken) {
   try {
     const reg = await navigator.serviceWorker.ready;
