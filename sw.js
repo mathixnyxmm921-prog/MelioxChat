@@ -17,12 +17,16 @@ self.addEventListener("push", (event) => {
       // Si ya estás mirando Meliox, no hace falta avisarte
       if (wins.some((w) => w.visibilityState === "visible" && w.focused)) return;
 
+      const isCall = data.type === "call";
       await self.registration.showNotification(data.title || "Meliox", {
         body: data.body || "Tienes un mensaje nuevo",
         icon: "/icon-192.png",
         badge: "/icon-192.png",
         tag: data.tag || "meliox",
         renotify: true,
+        // Las llamadas se quedan en pantalla y vibran como un timbre
+        requireInteraction: isCall,
+        vibrate: isCall ? [400, 200, 400, 200, 400, 200, 400] : [150, 80, 150],
         data: { phone: data.phone || null },
       });
     })()
