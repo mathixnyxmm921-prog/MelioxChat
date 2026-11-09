@@ -746,9 +746,10 @@ async function ensurePushSubscription() {
 }
 
 async function testPush() {
+  toast("En 5 segundos te llega una prueba. Minimiza Meliox para verla.");
   try {
     await api("/api/push/test", { method: "POST" });
-    toast("En 5 segundos te llega una prueba. Minimiza Meliox para verla.");
+    toast("Prueba enviada ✓ Si no la ves, revisa los permisos de notificaciones del celular.");
   } catch (ex) { toast(ex.message); }
 }
 
@@ -781,7 +782,7 @@ async function setupNotifications() {
   try { swReg = await navigator.serviceWorker.register("/sw.js"); }
   catch { return showNotifBanner("No se pudo iniciar el servicio de notificaciones.", { label: "Reintentar", action: setupNotifications }); }
 
-  if (Notification.permission === "granted") return activatePush(false);
+  if (Notification.permission === "granted") return activatePush(true);
   if (Notification.permission === "denied") {
     return showNotifBanner("Las notificaciones están bloqueadas. Actívalas en los ajustes del navegador (candado junto a la dirección).", null);
   }
