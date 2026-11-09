@@ -304,7 +304,6 @@ async function refreshMe() {
   renderSidebar();
   updatePeerHeader();
 
-  // Contador de mensajes sin leer en la pestaña y en el ícono de la app
   const unreadTotal = friends.reduce((a, f) => a + (f.unread || 0), 0);
   baseTitle = unreadTotal ? `(${unreadTotal}) Meliox` : "Meliox";
   if (!blinkTimer) document.title = baseTitle;
@@ -815,15 +814,13 @@ if ("serviceWorker" in navigator) {
 }
 
 // ---------- Llamadas y videollamadas (WebRTC) ----------
-// Nota: dentro de tu casa funciona con STUN. Entre redes distintas (datos móviles) puede
-// fallar en algunas conexiones: ahí haría falta un servidor TURN.
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
 ];
 const RING_TIMEOUT = 45000;
 
-let call = null; // { id, peer, video, role, pc, stream, cands, offer, timer, tick, startedAt }
+let call = null;
 const callEl = $("#call");
 const remoteVideo = $("#remote-video");
 const localVideo = $("#local-video");
@@ -965,7 +962,6 @@ async function acceptCall() {
   }
 }
 
-// reason: texto que se muestra un momento; notify: avisar al otro; type: end | reject
 function endCall(reason, notify, type = "end") {
   const c = call;
   if (!c) return;
@@ -1026,7 +1022,6 @@ async function drainSignals() {
   } catch {}
   draining = false;
 }
-// Revisa llamadas entrantes cada 2 s (funciona aunque el tiempo real esté bloqueado)
 setInterval(() => { if (!document.hidden || call) drainSignals(); }, 2000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) drainSignals(); });
 
@@ -1078,8 +1073,6 @@ function connect() {
   es.addEventListener("ready", () => { refreshMe(); if (current) loadMessages(false); });
 }
 
-// Red de seguridad: si algún intermediario (proxy, túnel) bloquea el tiempo real,
-// la app igual se actualiza cada 15 s y al volver a la pestaña.
 function syncNow() {
   if (!token || !me || document.hidden) return;
   if (current) loadMessages(false);
@@ -1095,7 +1088,6 @@ async function startApp() {
     show("home");
     connect();
     setupNotifications();
-    // Si venimos de tocar una notificación (/?chat=3001234567), abrimos ese chat
     const wanted = new URLSearchParams(location.search).get("chat");
     if (wanted) {
       history.replaceState(null, "", location.pathname);
@@ -1107,8 +1099,6 @@ async function startApp() {
   }
 }
 
-// Quita este dispositivo de las notificaciones de la cuenta que se cierra
-// (usa fetch directo para no depender de api(), que llama a logout en un 401)
 async function dropPush(oldToken) {
   try {
     const reg = await navigator.serviceWorker.ready;
