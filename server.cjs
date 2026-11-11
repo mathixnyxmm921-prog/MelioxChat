@@ -3,6 +3,7 @@
 // Uso:  node server.cjs   →  http://localhost:3001
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -96,28 +97,262 @@ const MANIFEST = {
   ],
 };
 
-// ---------- Base de datos (archivo JSON) ----------
+// ---------- Base de datos ----------
+// Local: archivo data.json.  En Render (gratis el disco se borra): Upstash Redis, gratis y permanente.
+// Si defines UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN, TODO se guarda allí
+// (cuentas, amigos, mensajes, sesiones y suscripciones a notificaciones) y no se pierde al reiniciar.
 let db = { users: {}, requests: [], messages: [], sessions: {}, vapid: null };
 try {
   db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, "utf8")) };
 } catch {}
 
+const REMOTE_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+const REMOTE_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const REMOTE = !!(REMOTE_URL && REMOTE_TOKEN);
+const MSG_CHUNK = 100; // mensajes por registro en Upstash
+
+function redis(commands, pipeline) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(REMOTE_URL + (pipeline ? "/pipeline" : ""));
+    const body = JSON.stringify(commands);
+    const req = https.request({
+      method: "POST",
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      timeout: 20000,
+      headers: {
+        Authorization: "Bearer " + REMOTE_TOKEN,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => {
+        let j;
+        try { j = JSON.parse(d); } catch { return reject(new Error("Respuesta inválida de Upstash (HTTP " + res.statusCode + ")")); }
+        if (res.statusCode >= 300) return reject(new Error((j && j.error) || "HTTP " + res.statusCode));
+        resolve(j);
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("tiempo agotado")));
+    req.end(body);
+  });
+}
+
+// Divide la base de datos en registros pequeños: meta, un registro por usuario y trozos de mensajes
+function snapshot() {
+  const out = new Map();
+  out.set("meliox:meta", JSON.stringify({ requests: db.requests, sessions: db.sessions, vapid: db.vapid }));
+  for (const [phone, u] of Object.entries(db.users)) out.set("meliox:user:" + phone, JSON.stringify(u));
+  for (let i = 0; i * MSG_CHUNK < db.messages.length; i++) {
+    out.set("meliox:msgs:" + i, JSON.stringify(db.messages.slice(i * MSG_CHUNK, (i + 1) * MSG_CHUNK)));
+  }
+  return out;
+}
+
+const written = new Map(); // lo último que sabemos que está guardado en Upstash
+async function flushOnce() {
+  const changed = [];
+  for (const [k, v] of snapshot()) if (written.get(k) !== v) changed.push([k, v]);
+  let batch = [], size = 0;
+  const send = async () => {
+    if (!batch.length) return;
+    const res = await redis(batch.map(([k, v]) => ["SET", k, v]), true);
+    res.forEach((x) => { if (x.error) throw new Error(x.error); });
+    batch.forEach(([k, v]) => written.set(k, v));
+    batch = []; size = 0;
+  };
+  for (const item of changed) {
+    if (size + item[1].length > 700000) await send(); // Upstash acepta ~1 MB por petición
+    batch.push(item);
+    size += item[1].length;
+  }
+  await send();
+}
+
+let flushPromise = null;
+let flushAgain = false;
+function flushRemote() {
+  if (flushPromise) { flushAgain = true; return flushPromise; }
+  flushPromise = (async () => {
+    try {
+      do { flushAgain = false; await flushOnce(); } while (flushAgain);
+    } catch (e) {
+      console.error("No se pudo guardar en Upstash (reintento en 5 s):", e.message);
+      setTimeout(save, 5000);
+    } finally {
+      flushPromise = null;
+    }
+  })();
+  return flushPromise;
+}
+
 let saveTimer = null;
 function save() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => fs.writeFile(DB_FILE, JSON.stringify(db), () => {}), 200);
+  saveTimer = setTimeout(() => {
+    fs.writeFile(DB_FILE, JSON.stringify(db), () => {}); // copia local
+    if (REMOTE) flushRemote();
+  }, REMOTE ? 800 : 200);
 }
 
-// ---------- Notificaciones push (opcional: npm install web-push) ----------
-let webpush = null;
-try { webpush = require("web-push"); } catch {}
-if (webpush) {
-  if (!db.vapid) { db.vapid = webpush.generateVAPIDKeys(); save(); }
-  webpush.setVapidDetails(
-    process.env.VAPID_SUBJECT || "mailto:meliox@example.com",
-    db.vapid.publicKey,
-    db.vapid.privateKey
-  );
+async function loadRemote() {
+  const keys = (await redis(["KEYS", "meliox:*"])).result || [];
+  if (!keys.length) return false;
+  const vals = new Map();
+  for (let i = 0; i < keys.length; i += 20) {
+    const part = keys.slice(i, i + 20);
+    const res = await redis(part.map((k) => ["GET", k]), true);
+    part.forEach((k, j) => {
+      if (res[j].error) throw new Error(res[j].error);
+      vals.set(k, res[j].result);
+    });
+  }
+  const next = { users: {}, requests: [], messages: [], sessions: {}, vapid: null };
+  const meta = vals.get("meliox:meta");
+  if (meta) {
+    const m = JSON.parse(meta);
+    next.requests = m.requests || [];
+    next.sessions = m.sessions || {};
+    next.vapid = m.vapid || null;
+  }
+  const chunks = [];
+  for (const [k, v] of vals) {
+    if (k.startsWith("meliox:user:")) next.users[k.slice(12)] = JSON.parse(v);
+    else if (k.startsWith("meliox:msgs:")) chunks.push([Number(k.slice(12)), JSON.parse(v)]);
+  }
+  chunks.sort((a, b) => a[0] - b[0]);
+  next.messages = chunks.flatMap((c) => c[1]);
+  db = next;
+  for (const [k, v] of snapshot()) written.set(k, v);
+  return true;
+}
+
+async function initDb() {
+  if (!REMOTE) return;
+  for (let i = 1; i <= 5; i++) {
+    try {
+      const had = await loadRemote();
+      if (had) console.log(`Upstash: cargados ${Object.keys(db.users).length} usuarios y ${db.messages.length} mensajes.`);
+      else { console.log("Upstash conectado (aún vacío): guardando lo que haya."); save(); }
+      return;
+    } catch (e) {
+      console.error(`Upstash (intento ${i}/5):`, e.message);
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+  // Sin la base de datos no arrancamos: así nunca se trabaja (ni se guarda) con datos vacíos por error
+  console.error("No se pudo conectar con Upstash. Revisa UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN.");
+  process.exit(1);
+}
+
+// Al apagar o reiniciar el servidor (Ctrl+C, nuevo despliegue) guarda todo antes de salir
+async function shutdown() {
+  clearTimeout(saveTimer);
+  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch {}
+  if (REMOTE) await Promise.race([flushRemote(), new Promise((r) => setTimeout(r, 8000))]);
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+// ---------- Notificaciones push (nativas: NO hay que instalar nada) ----------
+// Implementa Web Push (RFC 8030 + 8291 + VAPID 8292) con el módulo crypto de Node.
+const b64u = (buf) => Buffer.from(buf).toString("base64url");
+const unb64u = (str) => Buffer.from(str, "base64url");
+
+let vapid = null; // { publicKey: base64url (65 bytes), privateKey: KeyObject }
+function initVapid() {
+  // Si defines VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY (en Render: Environment) las llaves no se pierden al reiniciar.
+  let pubB64 = process.env.VAPID_PUBLIC_KEY;
+  let privB64 = process.env.VAPID_PRIVATE_KEY;
+  let fromEnv = !!(pubB64 && privB64);
+  if (!fromEnv && db.vapid && db.vapid.publicKey && db.vapid.privateKey) {
+    pubB64 = db.vapid.publicKey;
+    privB64 = db.vapid.privateKey;
+  }
+  if (!pubB64 || !privB64) {
+    const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const jwk = privateKey.export({ format: "jwk" });
+    pubB64 = b64u(Buffer.concat([Buffer.from([4]), unb64u(jwk.x), unb64u(jwk.y)]));
+    privB64 = jwk.d;
+    db.vapid = { publicKey: pubB64, privateKey: privB64 };
+    save();
+  }
+  const pubRaw = unb64u(pubB64);
+  const privateKey = crypto.createPrivateKey({
+    key: { kty: "EC", crv: "P-256", d: privB64, x: b64u(pubRaw.subarray(1, 33)), y: b64u(pubRaw.subarray(33, 65)) },
+    format: "jwk",
+  });
+  vapid = { publicKey: pubB64, privateKey, fromEnv, privB64 };
+}
+
+function vapidHeader(endpoint) {
+  const head = b64u(JSON.stringify({ typ: "JWT", alg: "ES256" }));
+  const body = b64u(JSON.stringify({
+    aud: new URL(endpoint).origin,
+    exp: Math.floor(Date.now() / 1000) + 12 * 3600,
+    sub: process.env.VAPID_SUBJECT || process.env.RENDER_EXTERNAL_URL || "mailto:meliox@example.com",
+  }));
+  const sig = crypto.sign("sha256", Buffer.from(head + "." + body), { key: vapid.privateKey, dsaEncoding: "ieee-p1363" });
+  return `vapid t=${head}.${body}.${b64u(sig)}, k=${vapid.publicKey}`;
+}
+
+// Cifrado del mensaje (aes128gcm). `fixed` solo se usa en pruebas.
+function encryptPayload(sub, payload, fixed) {
+  const uaPub = unb64u(sub.keys.p256dh);
+  const auth = unb64u(sub.keys.auth);
+  const ecdh = (fixed && fixed.ecdh) || crypto.createECDH("prime256v1");
+  if (!fixed || !fixed.ecdh) ecdh.generateKeys();
+  const asPub = ecdh.getPublicKey();
+  const secret = ecdh.computeSecret(uaPub);
+  const salt = (fixed && fixed.salt) || crypto.randomBytes(16);
+  const keyInfo = Buffer.concat([Buffer.from("WebPush: info\0"), uaPub, asPub]);
+  const ikm = Buffer.from(crypto.hkdfSync("sha256", secret, auth, keyInfo, 32));
+  const cek = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: aes128gcm\0"), 16));
+  const nonce = Buffer.from(crypto.hkdfSync("sha256", ikm, salt, Buffer.from("Content-Encoding: nonce\0"), 12));
+  const cipher = crypto.createCipheriv("aes-128-gcm", cek, nonce);
+  const enc = Buffer.concat([cipher.update(Buffer.concat([Buffer.from(payload), Buffer.from([2])])), cipher.final(), cipher.getAuthTag()]);
+  const header = Buffer.alloc(21);
+  salt.copy(header, 0);
+  header.writeUInt32BE(4096, 16);
+  header[20] = asPub.length;
+  return Buffer.concat([header, asPub, enc]);
+}
+
+function sendWebPush(sub, payload, { ttl = 86400, urgency = "high" } = {}) {
+  return new Promise((resolve, reject) => {
+    let body, u;
+    try { body = encryptPayload(sub, payload); u = new URL(sub.endpoint); } catch (e) { return reject(e); }
+    const req = https.request({
+      method: "POST",
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      timeout: 15000,
+      headers: {
+        "Content-Encoding": "aes128gcm",
+        "Content-Type": "application/octet-stream",
+        "Content-Length": body.length,
+        TTL: String(ttl),
+        Urgency: urgency,
+        Authorization: vapidHeader(sub.endpoint),
+      },
+    }, (res) => {
+      let d = "";
+      res.on("data", (c) => (d += c));
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve({ status: res.statusCode });
+        else reject(Object.assign(new Error(d.slice(0, 200) || "HTTP " + res.statusCode), { statusCode: res.statusCode }));
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("tiempo agotado")));
+    req.end(body);
+  });
 }
 
 // ---------- Utilidades ----------
@@ -129,9 +364,11 @@ function push(phone, event, data = {}) {
   }
 }
 
-// Avisa a los celulares/navegadores de `to` que `from` le escribió
+// Avisa a los celulares/navegadores de `to` que `from` le escribió.
+// Devuelve un resultado por dispositivo: [{ ok, status, error }]
 async function sendPush(to, from, text, extra = {}, opts = {}) {
-  if (!webpush || !to || !to.push || !to.push.length) return;
+  const results = [];
+  if (!to || !to.push || !to.push.length) return results;
   const payload = JSON.stringify({
     title: from.name,
     body: text.length > 140 ? text.slice(0, 137) + "…" : text,
@@ -141,17 +378,20 @@ async function sendPush(to, from, text, extra = {}, opts = {}) {
   });
   for (const sub of [...to.push]) {
     try {
-      await webpush.sendNotification(sub, payload, { TTL: 86400, urgency: "high", ...opts });
+      const r = await sendWebPush(sub, payload, opts);
+      results.push({ ok: true, status: r.status });
     } catch (e) {
+      results.push({ ok: false, status: e.statusCode, error: e.message });
       if (e.statusCode === 404 || e.statusCode === 410) {
         // Ese dispositivo ya no existe: lo quito de la lista
         to.push = to.push.filter((s) => s.endpoint !== sub.endpoint);
         save();
       } else {
-        console.error("push:", e.statusCode || e.message);
+        console.error("push falló:", e.statusCode || "", e.message);
       }
     }
   }
+  return results;
 }
 
 // Señales de llamadas (WebRTC): se guardan unos segundos hasta que el destinatario las recoge
@@ -198,6 +438,9 @@ function authUser(req, url) {
 function newSession(phone) {
   const token = crypto.randomBytes(24).toString("hex");
   db.sessions[token] = phone;
+  // Máximo 10 sesiones abiertas por persona (se borran las más viejas)
+  const mine = Object.keys(db.sessions).filter((t) => db.sessions[t] === phone);
+  for (const t of mine.slice(0, Math.max(0, mine.length - 10))) delete db.sessions[t];
   save();
   return token;
 }
@@ -274,11 +517,10 @@ async function api(req, res, url, p) {
   }
 
   if (m === "GET" && p === "/api/push/key") {
-    return json(res, 200, { key: webpush ? db.vapid.publicKey : null });
+    return json(res, 200, { key: vapid.publicKey });
   }
 
   if (m === "POST" && p === "/api/push/subscribe") {
-    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     const { subscription: s } = await readBody(req);
     const ok =
       s && typeof s.endpoint === "string" && s.endpoint.startsWith("https://") && s.endpoint.length < 1000 &&
@@ -304,11 +546,16 @@ async function api(req, res, url, p) {
   }
 
   if (m === "POST" && p === "/api/push/test") {
-    if (!webpush) fail(503, "El servidor no tiene instaladas las notificaciones push.");
     if (!user.push || !user.push.length) fail(400, "Este dispositivo todavía no está suscrito.");
     // Espera 5 s para que alcances a minimizar la app y veas la notificación
-    setTimeout(() => sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" }), 5000);
-    return json(res, 200, { ok: true });
+    await new Promise((r) => setTimeout(r, 5000));
+    const results = await sendPush(user, { name: "Meliox", phone: "" }, "¡Las notificaciones funcionan! 🎉", { tag: "test" });
+    const good = results.filter((r) => r.ok).length;
+    if (!good) {
+      const bad = results[0] || {};
+      fail(502, "El servicio de notificaciones del celular rechazó el envío (" + (bad.status || bad.error || "sin respuesta") + ").");
+    }
+    return json(res, 200, { ok: true, sent: good });
   }
 
   if (m === "GET" && p === "/api/signals") {
@@ -332,7 +579,7 @@ async function api(req, res, url, p) {
     if (type === "offer") {
       // Suena en el celular aunque la app esté cerrada
       sendPush(target, user, video ? "🎥 Videollamada entrante" : "📞 Llamada entrante",
-        { type: "call", tag: "call-" + user.phone }, { TTL: 30 });
+        { type: "call", tag: "call-" + user.phone }, { ttl: 30 });
     } else if (type === "end" && missed) {
       sendPush(target, user, "📞 Llamada perdida", { type: "missed", tag: "call-" + user.phone });
     }
@@ -478,6 +725,11 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (p === "/health") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+
   if (p === "/manifest.webmanifest") {
     res.writeHead(200, { "Content-Type": "application/manifest+json; charset=utf-8" });
     return res.end(JSON.stringify(MANIFEST));
@@ -503,17 +755,28 @@ setInterval(() => {
   for (const set of clients.values()) for (const res of set) res.write(": ping\n\n");
 }, 25000);
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`\nMeliox listo en http://localhost:${PORT}`);
-  console.log(
-    webpush
-      ? "Notificaciones push: activas"
-      : "Notificaciones push: DESACTIVADAS (falta instalar. Corre:  npm install web-push)"
-  );
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const i of list || []) {
-      if (i.family === "IPv4" && !i.internal) console.log(`Desde otro celular en tu Wi-Fi: http://${i.address}:${PORT}`);
+async function start() {
+  await initDb();
+  initVapid();
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`\nMeliox listo en http://localhost:${PORT}`);
+    console.log("Notificaciones push: activas (sin instalar nada)");
+    console.log(REMOTE
+      ? "Datos: guardados en Upstash (no se pierden al reiniciar)"
+      : "Datos: guardados en data.json (en Render gratis se BORRAN al reiniciar: configura Upstash)");
+    if (!REMOTE && !vapid.fromEnv) {
+      console.log("Consejo (Render): para que las llaves de notificaciones no se pierdan al reiniciar, crea estas dos variables en Environment:");
+      console.log("  VAPID_PUBLIC_KEY  = " + vapid.publicKey);
+      console.log("  VAPID_PRIVATE_KEY = " + vapid.privB64);
     }
-  }
-  console.log("");
-});
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const i of list || []) {
+        if (i.family === "IPv4" && !i.internal) console.log(`Desde otro celular en tu Wi-Fi: http://${i.address}:${PORT}`);
+      }
+    }
+    console.log("");
+  });
+}
+if (require.main === module) start();
+
+module.exports = { encryptPayload, vapidHeader, initVapid };
