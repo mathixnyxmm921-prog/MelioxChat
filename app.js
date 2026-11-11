@@ -718,29 +718,45 @@ function b64ToUint8(b64) {
   return Uint8Array.from(raw, (c) => c.charCodeAt(0));
 }
 
-// Devuelve "ok", "no-server" (el servidor no tiene web-push) o "error"
+// Devuelve "ok", "no-server" o "error" (el motivo queda en pushError)
+let pushError = "";
 async function ensurePushSubscription() {
-  if (!swReg || !token) return "error";
+  pushError = "";
+  if (!swReg || !token) { pushError = "no hay sesión iniciada o el servicio de notificaciones no arrancó"; return "error"; }
   try {
     const { key } = await api("/api/push/key");
     if (!key) return "no-server";
     const reg = await navigator.serviceWorker.ready;
+    const want = b64ToUint8(key);
     let sub = await reg.pushManager.getSubscription();
     if (sub) {
       // Si el servidor cambió de llave, la suscripción vieja ya no sirve
       const cur = new Uint8Array(sub.options.applicationServerKey || []);
-      const want = b64ToUint8(key);
       if (cur.length !== want.length || cur.some((v, i) => v !== want[i])) {
         await sub.unsubscribe();
         sub = null;
       }
     }
-    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
+    if (!sub) {
+      try {
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+      } catch (e1) {
+        // A veces falla la primera vez: se espera y se intenta otra vez
+        await new Promise((r) => setTimeout(r, 1500));
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: want });
+      }
+    }
     await api("/api/push/subscribe", { method: "POST", body: { subscription: sub.toJSON() } });
     pushActive = true;
     return "ok";
   } catch (ex) {
     console.warn("Push:", ex);
+    const name = (ex && ex.name) || "Error";
+    const msg = (ex && ex.message) || String(ex);
+    pushError = name + ": " + msg;
+    if (name === "AbortError") {
+      pushError += " — el navegador no logra conectar con el servicio de notificaciones de Google (revisa Brave, VPN, antivirus o firewall).";
+    }
     return "error";
   }
 }
@@ -764,7 +780,7 @@ async function activatePush(announce) {
   } else if (r === "no-server") {
     showNotifBanner("El servidor no tiene las notificaciones instaladas (falta correr: npm install web-push).", null);
   } else {
-    showNotifBanner("No se pudieron activar las notificaciones en este dispositivo.", { label: "Reintentar", action: () => activatePush(true) });
+    showNotifBanner("No se pudieron activar las notificaciones. Motivo: " + pushError, { label: "Reintentar", action: () => activatePush(true) });
   }
 }
 
