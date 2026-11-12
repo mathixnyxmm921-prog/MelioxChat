@@ -175,12 +175,17 @@ async function flushOnce() {
 
 let flushPromise = null;
 let flushAgain = false;
+let lastSaveOk = null;
+let lastSaveError = null;
 function flushRemote() {
   if (flushPromise) { flushAgain = true; return flushPromise; }
   flushPromise = (async () => {
     try {
       do { flushAgain = false; await flushOnce(); } while (flushAgain);
+      lastSaveOk = Date.now();
+      lastSaveError = null;
     } catch (e) {
+      lastSaveError = e.message;
       console.error("No se pudo guardar en Upstash (reintento en 5 s):", e.message);
       setTimeout(save, 5000);
     } finally {
@@ -191,24 +196,32 @@ function flushRemote() {
 }
 
 let saveTimer = null;
+let dirtyN = 0;       // cuenta los cambios (para no pisar datos al recargar)
+let dirtySince = 0;   // desde cuándo hay cambios sin guardar
 function save() {
+  dirtyN++;
+  if (!dirtySince) dirtySince = Date.now();
   clearTimeout(saveTimer);
+  // Espera un poco para juntar cambios, pero nunca más de 5 s seguidos sin guardar
+  const wait = Math.min(REMOTE ? 800 : 200, Math.max(0, dirtySince + 5000 - Date.now()));
   saveTimer = setTimeout(() => {
+    dirtySince = 0;
     fs.writeFile(DB_FILE, JSON.stringify(db), () => {}); // copia local
     if (REMOTE) flushRemote();
-  }, REMOTE ? 800 : 200);
+  }, wait);
 }
 
-async function loadRemote() {
+// Lee todo lo guardado en Upstash y lo devuelve (sin tocar `db`). null = Upstash está vacío.
+async function fetchRemote() {
   const keys = (await redis(["KEYS", "meliox:*"])).result || [];
-  if (!keys.length) return false;
+  if (!keys.length) return null;
   const vals = new Map();
   for (let i = 0; i < keys.length; i += 20) {
     const part = keys.slice(i, i + 20);
     const res = await redis(part.map((k) => ["GET", k]), true);
     part.forEach((k, j) => {
       if (res[j].error) throw new Error(res[j].error);
-      vals.set(k, res[j].result);
+      if (res[j].result != null) vals.set(k, res[j].result);
     });
   }
   const next = { users: {}, requests: [], messages: [], sessions: {}, vapid: null };
@@ -226,10 +239,47 @@ async function loadRemote() {
   }
   chunks.sort((a, b) => a[0] - b[0]);
   next.messages = chunks.flatMap((c) => c[1]);
+  return next;
+}
+
+function adopt(next) {
   db = next;
+  written.clear();
   for (const [k, v] of snapshot()) written.set(k, v);
+}
+
+async function loadRemote() {
+  const next = await fetchRemote();
+  if (!next) return false;
+  adopt(next);
   return true;
 }
+
+// ¿Todo lo que tengo en memoria ya está guardado en Upstash?
+function isClean() {
+  if (flushPromise || dirtySince) return false;
+  for (const [k, v] of snapshot()) if (written.get(k) !== v) return false;
+  return true;
+}
+
+// En Render, al subir un cambio el servicio viejo y el nuevo conviven unos segundos:
+// el nuevo pudo haber leído los datos antes de que el viejo terminara de guardar.
+// Por eso se vuelve a leer Upstash justo antes de atender la primera petición
+// (y otra vez al minuto), pero SOLO si no hay nada pendiente por guardar, para nunca pisar datos.
+async function refreshFromRemote() {
+  if (!REMOTE || !isClean()) return;
+  const n = dirtyN;
+  try {
+    const next = await fetchRemote();
+    if (!next || dirtyN !== n || !isClean()) return; // cambió algo mientras leía: no se pisa
+    adopt(next);
+    if (vapid && !vapid.fromEnv) initVapid(); // por si las llaves de notificaciones cambiaron
+  } catch (e) {
+    console.error("No se pudo refrescar desde Upstash:", e.message);
+  }
+}
+let freshGate = null;
+const ensureFresh = () => (freshGate = freshGate || refreshFromRemote());
 
 async function initDb() {
   if (!REMOTE) return;
@@ -488,7 +538,7 @@ async function api(req, res, url, p) {
 
   if (m === "POST" && p === "/api/login") {
     const { phone, password } = await readBody(req);
-    const user = db.users[String(phone || "")];
+    const user = PHONE_RE.test(String(phone || "")) ? db.users[String(phone)] : null;
     if (!user) fail(400, "Número o contraseña incorrectos.");
     const a = Buffer.from(hashPass(String(password || ""), user.salt), "hex");
     const b = Buffer.from(user.hash, "hex");
@@ -717,7 +767,7 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   if (p.startsWith("/api/")) {
-    try { await api(req, res, url, p); }
+    try { await ensureFresh(); await api(req, res, url, p); }
     catch (e) {
       if (!res.headersSent) json(res, e.status || 500, { error: e.status ? e.message : "Error del servidor." });
       if (!e.status) console.error(e);
@@ -728,6 +778,21 @@ const server = http.createServer(async (req, res) => {
   if (p === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     return res.end("ok");
+  }
+
+  // Para comprobar dónde se guardan los datos (abre /estado en el navegador). No muestra nada secreto.
+  if (p === "/estado") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify({
+      guardado_en: REMOTE ? "Upstash (permanente)" : "archivo data.json (en Render gratis SE BORRA)",
+      upstash_configurado: REMOTE,
+      ultimo_guardado_ok: lastSaveOk ? new Date(lastSaveOk).toISOString() : null,
+      error_de_guardado: lastSaveError,
+      usuarios: Object.keys(db.users).length,
+      mensajes: db.messages.length,
+      en_render: !!process.env.RENDER,
+      aviso: !REMOTE && process.env.RENDER ? "Faltan las variables UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN en Render: las cuentas se pierden al reiniciar." : null,
+    }, null, 2));
   }
 
   if (p === "/manifest.webmanifest") {
@@ -761,6 +826,7 @@ async function start() {
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`\nMeliox listo en http://localhost:${PORT}`);
     console.log("Notificaciones push: activas (sin instalar nada)");
+    if (REMOTE) setTimeout(refreshFromRemote, 60000);
     console.log(REMOTE
       ? "Datos: guardados en Upstash (no se pierden al reiniciar)"
       : "Datos: guardados en data.json (en Render gratis se BORRAN al reiniciar: configura Upstash)");
