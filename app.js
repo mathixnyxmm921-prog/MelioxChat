@@ -71,6 +71,7 @@ let longPressed = false; // para "mantener presionado" en el celular
 let longTimer = null;
 let swReg = null;        // service worker (notificaciones push)
 let pushActive = false;  // este dispositivo ya recibe notificaciones push
+let replyingTo = null;   // mensaje al que estoy respondiendo { id, from, text }
 
 async function api(path, opts = {}) {
   let res;
@@ -364,7 +365,9 @@ function renderSidebar() {
     return;
   }
   list.forEach((f) => {
-    const preview = f.last ? (f.last.from === me.phone ? "Tú: " : "") + f.last.text : "Toca para chatear";
+    const preview = f.last
+      ? (f.last.from === me.phone ? "Tú: " : "") + (f.last.deleted ? "🚫 Mensaje eliminado" : f.last.text)
+      : "Toca para chatear";
     const cancelPress = () => clearTimeout(longTimer);
     ul.append(
       h("li", {
@@ -407,6 +410,7 @@ async function openChat(phone) {
   const f = friends.find((x) => x.phone === phone);
   if (!f) return;
   current = phone;
+  clearReply();
   updatePeerHeader();
   $("#chat-empty").classList.add("hidden");
   $("#chat").classList.remove("hidden");
@@ -434,16 +438,20 @@ function renderMessages(forceScroll) {
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
   box.innerHTML = "";
   let lastTs = null;
+  // Si el mensaje al que respondía se eliminó para todos, se quita la respuesta
+  if (replyingTo && msgs.some((x) => x.id === replyingTo.id && x.deleted)) clearReply();
   msgs.forEach((m) => {
     if (lastTs === null || !sameDay(m.ts, lastTs)) box.append(h("div", { class: "day" }, dayLabel(m.ts)));
     lastTs = m.ts;
     const mine = m.from === me.phone;
-    box.append(
-      h("div", { class: "bubble " + (mine ? "mine" : "theirs") },
-        h("span", { class: "text" }, m.text),
-        h("span", { class: "meta" }, fmtTime(m.ts), mine ? h("span", { class: "tick" + (m.read ? " read" : "") }, m.read ? "✓✓" : "✓") : "")
-      )
+    const bubble = h("div", { class: "bubble " + (mine ? "mine" : "theirs") + (m.deleted ? " deleted" : ""), "data-id": m.id });
+    if (m.reply) bubble.append(quoteEl(m.reply));
+    bubble.append(
+      h("span", { class: "text" }, m.deleted ? (mine ? "🚫 Eliminaste este mensaje" : "🚫 Se eliminó este mensaje") : m.text),
+      h("span", { class: "meta" }, fmtTime(m.ts), mine && !m.deleted ? h("span", { class: "tick" + (m.read ? " read" : "") }, m.read ? "✓✓" : "✓") : "")
     );
+    attachMsgEvents(bubble, m);
+    box.append(bubble);
   });
   if (forceScroll || nearBottom) box.scrollTop = box.scrollHeight;
 }
@@ -454,8 +462,11 @@ $("#composer").addEventListener("submit", async (e) => {
   const text = input.value.trim();
   if (!text || !current) return;
   input.value = "";
+  const body = { to: current, text };
+  if (replyingTo) body.replyTo = replyingTo.id;
   try {
-    const m = await api("/api/messages", { method: "POST", body: { to: current, text } });
+    const m = await api("/api/messages", { method: "POST", body });
+    clearReply();
     msgs.push(m);
     renderMessages(true);
     refreshMe();
@@ -467,6 +478,7 @@ $("#composer").addEventListener("submit", async (e) => {
 
 function closeChat() {
   current = null;
+  clearReply();
   msgs = [];
   $("#view-home").classList.remove("chat-open");
   $("#chat").classList.add("hidden");
@@ -519,6 +531,209 @@ $("#confirm-ok").addEventListener("click", async () => {
   } catch (ex) {
     $("#confirm-msg").textContent = ex.message;
   }
+});
+
+// ---------- Mensajes: responder, copiar y eliminar (como WhatsApp) ----------
+// Computadora: clic derecho sobre un mensaje.  Celular: mantener presionado (o deslizar a la derecha para responder).
+(function addMessageStyles() {
+  const st = document.createElement("style");
+  st.textContent = `
+    .bubble { touch-action: pan-y; }
+    .bubble.deleted .text { font-style: italic; color: rgba(233, 237, 239, 0.6); }
+    .bubble .quote {
+      flex-basis: 100%; min-width: 0; margin: 0 0 4px; padding: 5px 8px; cursor: pointer;
+      border-left: 4px solid var(--accent); background: rgba(0, 0, 0, 0.22); border-radius: 6px; font-size: 0.82rem;
+    }
+    .bubble .quote b { display: block; color: var(--accent); font-size: 0.76rem; }
+    .bubble .quote span { display: block; color: rgba(233, 237, 239, 0.75); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bubble.flash { animation: flashMsg 1.4s ease-out; }
+    @keyframes flashMsg { 0%, 45% { box-shadow: 0 0 0 3px rgba(31, 216, 164, 0.8); } 100% { box-shadow: 0 1px 1px rgba(0, 0, 0, 0.25); } }
+    @media (pointer: coarse) { .bubble { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; } }
+    .reply-bar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--panel-2); border-top: 1px solid var(--line); }
+    .reply-bar .rq { flex: 1; min-width: 0; padding: 3px 10px; border-left: 4px solid var(--accent); background: rgba(0, 0, 0, 0.2); border-radius: 6px; }
+    .reply-bar .rq b { display: block; color: var(--accent); font-size: 0.78rem; }
+    .reply-bar .rq span { display: block; color: var(--muted); font-size: 0.85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mmenu {
+      position: fixed; z-index: 30; min-width: 200px; padding: 4px;
+      background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+    .mmenu button {
+      display: block; width: 100%; text-align: left; padding: 11px 12px; background: none; border: none; border-radius: 8px;
+      color: var(--text); font-size: 0.95rem; cursor: pointer;
+    }
+    .mmenu button:hover { background: rgba(255, 255, 255, 0.07); }
+    .mmenu button.danger { color: var(--danger); }
+    .del-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  `;
+  document.head.append(st);
+})();
+
+let msgLongPressed = false;
+
+// Barra "Respondiendo a…" encima de la caja de texto
+const replyBar = h("div", { class: "reply-bar hidden", id: "reply-bar" },
+  h("div", { class: "rq" }, h("b", { id: "reply-who" }), h("span", { id: "reply-text" })),
+  h("button", { type: "button", class: "icon-btn", title: "Cancelar respuesta", "aria-label": "Cancelar respuesta", onclick: () => clearReply() }, "✕")
+);
+$("#chat").insertBefore(replyBar, $("#composer"));
+
+function senderName(phone) {
+  if (me && phone === me.phone) return "Tú";
+  const f = friends.find((x) => x.phone === phone);
+  return f ? f.name : "Mensaje";
+}
+
+function setReply(m) {
+  if (!m || m.deleted) return;
+  replyingTo = { id: m.id, from: m.from, text: m.text };
+  $("#reply-who").textContent = senderName(m.from);
+  $("#reply-text").textContent = m.text;
+  replyBar.classList.remove("hidden");
+  $("#msg-input").focus();
+}
+function clearReply() {
+  replyingTo = null;
+  replyBar.classList.add("hidden");
+}
+
+function quoteEl(r) {
+  const txt = r.gone ? "Mensaje no disponible" : r.deleted ? "🚫 Mensaje eliminado" : r.text;
+  return h("div", { class: "quote", onclick: (e) => { e.stopPropagation(); jumpToMessage(r.id); } },
+    h("b", {}, senderName(r.from)),
+    h("span", {}, txt)
+  );
+}
+
+function jumpToMessage(id) {
+  const el = $("#messages").querySelector('[data-id="' + id + '"]');
+  if (!el) return toast("El mensaje original ya no está en este chat.");
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.classList.remove("flash");
+  void el.offsetWidth;
+  el.classList.add("flash");
+}
+
+// Menú del mensaje
+const msgMenu = h("div", { class: "mmenu hidden", id: "msg-menu" });
+document.body.append(msgMenu);
+const closeMsgMenu = () => msgMenu.classList.add("hidden");
+
+function copyText(text) {
+  const done = () => toast("Copiado");
+  try {
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text).then(done, () => toast("No se pudo copiar."));
+    const ta = h("textarea", { style: "position:fixed;opacity:0" });
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    done();
+  } catch { toast("No se pudo copiar."); }
+}
+
+function openMsgMenu(x, y, m) {
+  closeCtx();
+  msgMenu.innerHTML = "";
+  if (!m.deleted) {
+    msgMenu.append(h("button", { type: "button", onclick: () => { closeMsgMenu(); setReply(m); } }, "Responder"));
+    msgMenu.append(h("button", { type: "button", onclick: () => { closeMsgMenu(); copyText(m.text); } }, "Copiar"));
+  }
+  msgMenu.append(h("button", { type: "button", class: "danger", onclick: () => { closeMsgMenu(); askDelete(m); } }, "Eliminar"));
+  msgMenu.classList.remove("hidden");
+  const w = msgMenu.offsetWidth, hgt = msgMenu.offsetHeight;
+  msgMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 4)) + "px";
+  msgMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - hgt - 4)) + "px";
+}
+
+// Clic derecho (computadora), mantener presionado y deslizar a la derecha (celular)
+function attachMsgEvents(bubble, m) {
+  let timer = null, sx = 0, sy = 0, dx = 0, swiping = false;
+  const cancel = () => clearTimeout(timer);
+  const reset = () => { cancel(); swiping = false; dx = 0; bubble.style.transform = ""; };
+
+  bubble.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(e.clientX, e.clientY, m); });
+  bubble.addEventListener("click", (e) => {
+    if (msgLongPressed) { e.stopPropagation(); msgLongPressed = false; } // el "levantar el dedo" no debe cerrar el menú
+  });
+  bubble.addEventListener("touchstart", (e) => {
+    msgLongPressed = false; swiping = false; dx = 0;
+    const t = e.touches[0];
+    sx = t.clientX; sy = t.clientY;
+    cancel();
+    timer = setTimeout(() => { msgLongPressed = true; vibrate(25); openMsgMenu(sx, sy, m); }, 500);
+  }, { passive: true });
+  bubble.addEventListener("touchmove", (e) => {
+    const t = e.touches[0];
+    dx = t.clientX - sx;
+    const dy = t.clientY - sy;
+    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) cancel();
+    if (!m.deleted && dx > 8 && Math.abs(dy) < Math.abs(dx)) {
+      swiping = true;
+      bubble.style.transform = "translateX(" + Math.min(dx, 70) + "px)";
+    }
+  }, { passive: true });
+  bubble.addEventListener("touchend", () => {
+    const reply = swiping && dx > 60;
+    reset();
+    if (reply) { vibrate(15); setReply(m); }
+  }, { passive: true });
+  bubble.addEventListener("touchcancel", reset, { passive: true });
+}
+
+// Ventana para eliminar
+const delModal = h("div", { class: "modal hidden", id: "del-modal" },
+  h("div", { class: "modal-card" },
+    h("h3", {}, "Eliminar mensaje"),
+    h("p", { class: "hint", id: "del-text" }),
+    h("p", { class: "form-msg", id: "del-msg" }),
+    h("div", { class: "del-actions" },
+      h("button", { type: "button", class: "btn danger", id: "del-all", onclick: () => doDelete("all") }, "Eliminar para todos"),
+      h("button", { type: "button", class: "btn danger", id: "del-me", onclick: () => doDelete("me") }, "Eliminar para mí"),
+      h("button", { type: "button", class: "btn secondary", onclick: () => closeDel() }, "Cancelar")
+    )
+  )
+);
+document.body.append(delModal);
+let delTarget = null;
+function closeDel() { delModal.classList.add("hidden"); delTarget = null; }
+delModal.addEventListener("click", (e) => { if (e.target === delModal) closeDel(); });
+
+function askDelete(m) {
+  delTarget = m;
+  // Para todos: solo mis propios mensajes que no se hayan eliminado ya
+  const canAll = m.from === (me && me.phone) && !m.deleted;
+  $("#del-all").classList.toggle("hidden", !canAll);
+  $("#del-text").textContent = canAll
+    ? "Elige cómo quieres eliminarlo."
+    : "Se borrará solo de tu chat. La otra persona lo seguirá viendo.";
+  $("#del-msg").textContent = "";
+  delModal.classList.remove("hidden");
+}
+
+async function doDelete(scope) {
+  const m = delTarget;
+  if (!m) return;
+  try {
+    await api("/api/messages/delete", { method: "POST", body: { id: m.id, scope } });
+    if (replyingTo && replyingTo.id === m.id) clearReply();
+    closeDel();
+    await loadMessages(false);
+    toast(scope === "all" ? "Mensaje eliminado para todos" : "Mensaje eliminado para ti");
+  } catch (ex) {
+    $("#del-msg").textContent = ex.message;
+  }
+}
+
+document.addEventListener("click", closeMsgMenu);
+document.addEventListener("scroll", closeMsgMenu, true);
+window.addEventListener("resize", closeMsgMenu);
+document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".bubble")) closeMsgMenu(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!msgMenu.classList.contains("hidden")) closeMsgMenu();
+  else if (!delModal.classList.contains("hidden")) closeDel();
+  else clearReply();
 });
 
 // ---------- Agregar amigo ----------
@@ -1091,6 +1306,10 @@ function connect() {
     if (current === by) loadMessages(false);
   });
   es.addEventListener("friends", () => refreshMe());
+  es.addEventListener("chat", (e) => {
+    const { peer } = JSON.parse(e.data);
+    if (current === peer) loadMessages(false); else refreshMe();
+  });
   es.addEventListener("ready", () => { refreshMe(); if (current) loadMessages(false); });
 }
 
