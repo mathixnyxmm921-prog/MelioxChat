@@ -496,16 +496,33 @@ function newSession(phone) {
 }
 
 const between = (m, a, b) => (m.from === a && m.to === b) || (m.from === b && m.to === a);
+// "Eliminar para mí": el mensaje queda guardado pero oculto para esa persona (hidden = [teléfonos])
+const hiddenFor = (m, phone) => Array.isArray(m.hidden) && m.hidden.includes(phone);
+
+// Lo que se envía al navegador: sin campos internos y con el mensaje citado ya resuelto.
+// NOTA: los mensajes nunca se quitan de la lista (solo se marcan), así los trozos de Upstash no se descuadran.
+function outMsg(m, byId) {
+  const o = { id: m.id, from: m.from, to: m.to, ts: m.ts, read: !!m.read, text: m.deleted ? "" : m.text };
+  if (m.deleted) o.deleted = true;
+  if (m.replyTo && !m.deleted) {
+    const q = byId ? byId.get(m.replyTo) : db.messages.find((x) => x.id === m.replyTo);
+    o.reply = q
+      ? { id: q.id, from: q.from, deleted: !!q.deleted, text: q.deleted ? "" : String(q.text).slice(0, 140) }
+      : { id: m.replyTo, gone: true };
+  }
+  return o;
+}
 
 function summary(user) {
   const friends = user.friends.flatMap((p) => {
     const f = db.users[p];
     if (!f) return [];
-    const msgs = db.messages.filter((m) => between(m, user.phone, p));
+    const msgs = db.messages.filter((m) => between(m, user.phone, p) && !hiddenFor(m, user.phone));
+    const last = msgs[msgs.length - 1];
     return [{
       ...pub(f),
-      last: msgs[msgs.length - 1] || null,
-      unread: msgs.filter((m) => m.from === p && !m.read).length,
+      last: last ? outMsg(last) : null,
+      unread: msgs.filter((m) => m.from === p && !m.read && !m.deleted).length,
     }];
   });
   const incoming = db.requests
@@ -721,28 +738,60 @@ async function api(req, res, url, p) {
     const other = url.searchParams.get("with");
     if (!user.friends.includes(other)) fail(403, "No son amigos todavía.");
     let changed = false;
-    const list = [];
+    const conv = [];
+    const byId = new Map();
     for (const msg of db.messages) {
       if (!between(msg, user.phone, other)) continue;
       if (msg.to === user.phone && !msg.read) { msg.read = true; changed = true; }
-      list.push(msg);
+      conv.push(msg);
+      byId.set(msg.id, msg);
     }
     if (changed) { save(); push(other, "read", { by: user.phone }); }
-    return json(res, 200, list.slice(-300));
+    const list = conv.filter((msg) => !hiddenFor(msg, user.phone));
+    return json(res, 200, list.slice(-300).map((msg) => outMsg(msg, byId)));
+  }
+
+  // Eliminar un mensaje: scope "me" (solo para mí) o "all" (para todos, solo si lo envié yo)
+  if (m === "POST" && p === "/api/messages/delete") {
+    const { id, scope } = await readBody(req);
+    const msg = typeof id === "string" ? db.messages.find((x) => x.id === id) : null;
+    if (!msg || (msg.from !== user.phone && msg.to !== user.phone)) fail(404, "Mensaje no encontrado.");
+    const other = msg.from === user.phone ? msg.to : msg.from;
+    if (scope === "all") {
+      if (msg.from !== user.phone) fail(403, "Solo puedes eliminar para todos los mensajes que enviaste tú.");
+      msg.deleted = true;
+      msg.text = "";
+      delete msg.replyTo;
+    } else if (scope === "me") {
+      if (!Array.isArray(msg.hidden)) msg.hidden = [];
+      if (!msg.hidden.includes(user.phone)) msg.hidden.push(user.phone);
+    } else {
+      fail(400, "Opción no válida.");
+    }
+    save();
+    if (scope === "all") push(other, "chat", { peer: user.phone }); // a la otra persona se le actualiza el chat
+    push(user.phone, "chat", { peer: other });                      // y a mis otras pestañas
+    return json(res, 200, { ok: true });
   }
 
   if (m === "POST" && p === "/api/messages") {
-    const { to, text } = await readBody(req);
+    const { to, text, replyTo } = await readBody(req);
     if (!user.friends.includes(to)) fail(403, "No son amigos todavía.");
     const t = String(text || "").trim();
     if (!t || t.length > 2000) fail(400, "Mensaje vacío o demasiado largo.");
     const msg = { id: crypto.randomUUID(), from: user.phone, to, text: t, ts: Date.now(), read: false };
+    if (replyTo !== undefined && replyTo !== null) {
+      // Responder a un mensaje de ESTE mismo chat que no esté eliminado
+      const q = typeof replyTo === "string" ? db.messages.find((x) => x.id === replyTo) : null;
+      if (!q || !between(q, user.phone, to) || q.deleted) fail(400, "No se puede responder a ese mensaje.");
+      msg.replyTo = q.id;
+    }
     db.messages.push(msg);
     save();
     push(to, "newmsg", { from: user.phone });
     sendPush(db.users[to], user, t); // notificación al celular (no espera respuesta)
     push(user.phone, "friends"); // sincroniza otras pestañas mías
-    return json(res, 200, msg);
+    return json(res, 200, outMsg(msg));
   }
 
   fail(404, "No encontrado.");
