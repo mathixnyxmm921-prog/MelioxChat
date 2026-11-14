@@ -87,7 +87,13 @@ async function api(path, opts = {}) {
   let data = {};
   try { data = await res.json(); } catch {}
   if (!res.ok) {
-    if (res.status === 401 && token) logout();
+    if (res.status === 401 && token) {
+      // Un 401 puede ser pasajero (el servidor acaba de reiniciarse): se reintenta una vez antes de cerrar la sesión
+      if (!opts._retried) {
+        await new Promise((r) => setTimeout(r, 1500));
+        if (token) return api(path, { ...opts, _retried: true });
+      } else logout();
+    }
     throw new Error(data.error || "Error de conexión.");
   }
   return data;
@@ -99,6 +105,16 @@ function show(name) {
   Object.values(views).forEach((v) => v.classList.add("hidden"));
   views[name].classList.remove("hidden");
 }
+
+// Pantalla "Conectando…" (mientras el servidor despierta; en Render gratis puede tardar hasta un minuto)
+const connectingEl = h("div", { class: "modal hidden", id: "connecting" },
+  h("div", { class: "modal-card" },
+    h("h3", {}, "Conectando…"),
+    h("p", { class: "hint", id: "connecting-text" }, "Abriendo tu sesión.")
+  )
+);
+document.body.append(connectingEl);
+
 $("#go-register").addEventListener("click", (e) => { e.preventDefault(); show("register"); });
 $("#go-login").addEventListener("click", (e) => { e.preventDefault(); show("login"); });
 
@@ -1325,20 +1341,32 @@ document.addEventListener("visibilitychange", syncNow);
 
 // ---------- Inicio / salida ----------
 async function startApp() {
-  try {
-    await refreshMe();
-    show("home");
-    connect();
-    setupNotifications();
-    // Si venimos de tocar una notificación (/?chat=3001234567), abrimos ese chat
-    const wanted = new URLSearchParams(location.search).get("chat");
-    if (wanted) {
-      history.replaceState(null, "", location.pathname);
-      openChat(wanted);
+  // Mientras se abre la sesión NO se muestra el login (así nadie cree que debe volver a entrar)
+  Object.values(views).forEach((v) => v.classList.add("hidden"));
+  connectingEl.classList.remove("hidden");
+  for (let tries = 0; ; tries++) {
+    try {
+      await refreshMe();
+      break;
+    } catch (ex) {
+      // Sin token = el servidor dijo de verdad que la sesión no vale (logout() ya mostró el login)
+      if (!token) { connectingEl.classList.add("hidden"); return; }
+      // Cualquier otro fallo (servidor dormido, sin internet): se espera y se reintenta, la sesión NO se pierde
+      $("#connecting-text").textContent = tries < 2
+        ? "Abriendo tu sesión…"
+        : "Despertando el servidor… puede tardar hasta un minuto. No cierres la app.";
+      await new Promise((r) => setTimeout(r, 3000));
     }
-  } catch (ex) {
-    if (token) toast(ex.message);
-    show("login");
+  }
+  connectingEl.classList.add("hidden");
+  show("home");
+  connect();
+  setupNotifications();
+  // Si venimos de tocar una notificación (/?chat=3001234567), abrimos ese chat
+  const wanted = new URLSearchParams(location.search).get("chat");
+  if (wanted) {
+    history.replaceState(null, "", location.pathname);
+    openChat(wanted);
   }
 }
 
