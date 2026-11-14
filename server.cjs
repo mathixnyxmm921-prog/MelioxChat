@@ -110,6 +110,8 @@ const REMOTE_URL = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, ""
 const REMOTE_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const REMOTE = !!(REMOTE_URL && REMOTE_TOKEN);
 const MSG_CHUNK = 100; // mensajes por registro en Upstash
+// Mientras no se hayan leído los datos de Upstash NUNCA se guarda nada allí (evita pisar datos con una base vacía)
+let loaded = !REMOTE;
 
 function redis(commands, pipeline) {
   return new Promise((resolve, reject) => {
@@ -155,6 +157,7 @@ function snapshot() {
 
 const written = new Map(); // lo último que sabemos que está guardado en Upstash
 async function flushOnce() {
+  if (!loaded) return;
   const changed = [];
   for (const [k, v] of snapshot()) if (written.get(k) !== v) changed.push([k, v]);
   let batch = [], size = 0;
@@ -209,6 +212,17 @@ function save() {
     fs.writeFile(DB_FILE, JSON.stringify(db), () => {}); // copia local
     if (REMOTE) flushRemote();
   }, wait);
+}
+
+// Guarda AHORA y espera a que Upstash lo confirme. Se usa en lo importante (cuentas, amigos, eliminar):
+// así, si la app le dijo "listo" a alguien, ya está guardado aunque Render reinicie un segundo después.
+async function persist() {
+  clearTimeout(saveTimer);
+  dirtySince = 0;
+  fs.writeFile(DB_FILE, JSON.stringify(db), () => {});
+  if (!REMOTE) return;
+  await flushRemote();
+  if (lastSaveError) throw new Error(lastSaveError);
 }
 
 // Lee todo lo guardado en Upstash y lo devuelve (sin tocar `db`). null = Upstash está vacío.
@@ -286,6 +300,7 @@ async function initDb() {
   for (let i = 1; i <= 5; i++) {
     try {
       const had = await loadRemote();
+      loaded = true;
       if (had) console.log(`Upstash: cargados ${Object.keys(db.users).length} usuarios y ${db.messages.length} mensajes.`);
       else { console.log("Upstash conectado (aún vacío): guardando lo que haya."); save(); }
       return;
@@ -302,8 +317,10 @@ async function initDb() {
 // Al apagar o reiniciar el servidor (Ctrl+C, nuevo despliegue) guarda todo antes de salir
 async function shutdown() {
   clearTimeout(saveTimer);
-  try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch {}
-  if (REMOTE) await Promise.race([flushRemote(), new Promise((r) => setTimeout(r, 8000))]);
+  if (loaded) { // si todavía estaba arrancando, no se guarda nada (la base estaría vacía)
+    try { fs.writeFileSync(DB_FILE, JSON.stringify(db)); } catch {}
+    if (REMOTE) await Promise.race([flushRemote(), new Promise((r) => setTimeout(r, 8000))]);
+  }
   process.exit(0);
 }
 process.on("SIGTERM", shutdown);
@@ -549,7 +566,13 @@ async function api(req, res, url, p) {
     const salt = crypto.randomBytes(16).toString("hex");
     db.users[phone] = { phone, name: n, photo, salt, hash: hashPass(password, salt), friends: [] };
     const token = newSession(phone);
-    save();
+    try {
+      await persist(); // la cuenta queda guardada ANTES de decirle "listo"
+    } catch {
+      delete db.users[phone];
+      delete db.sessions[token];
+      fail(503, "No se pudo guardar tu cuenta. Intenta de nuevo en unos segundos.");
+    }
     return json(res, 200, { token, me: pub(db.users[phone]) });
   }
 
@@ -669,7 +692,7 @@ async function api(req, res, url, p) {
     }
     user.name = newName;
     user.photo = newPhoto;
-    save();
+    await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
     // Avisa a amigos, a quienes tienen una solicitud mía y a mis otras pestañas
     const notify = new Set([
       ...user.friends,
@@ -695,12 +718,12 @@ async function api(req, res, url, p) {
       db.requests.splice(reverse, 1);
       user.friends.push(phone);
       target.friends.push(user.phone);
-      save();
+      await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
       push(phone, "friends");
       return json(res, 200, { status: "accepted", name: target.name });
     }
     db.requests.push({ from: user.phone, to: phone });
-    save();
+    await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
     push(phone, "friends");
     return json(res, 200, { status: "sent", name: target.name });
   }
@@ -714,7 +737,7 @@ async function api(req, res, url, p) {
       if (!user.friends.includes(phone)) user.friends.push(phone);
       if (!db.users[phone].friends.includes(user.phone)) db.users[phone].friends.push(user.phone);
     }
-    save();
+    await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
     push(phone, "friends");
     return json(res, 200, { ok: true });
   }
@@ -728,7 +751,7 @@ async function api(req, res, url, p) {
     db.requests = db.requests.filter(
       (r) => !((r.from === user.phone && r.to === phone) || (r.from === phone && r.to === user.phone))
     );
-    save();
+    await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
     push(phone, "friends");
     push(user.phone, "friends");
     return json(res, 200, { ok: true });
@@ -768,7 +791,7 @@ async function api(req, res, url, p) {
     } else {
       fail(400, "Opción no válida.");
     }
-    save();
+    await persist().catch(() => fail(503, "No se pudo guardar. Intenta de nuevo."));
     if (scope === "all") push(other, "chat", { peer: user.phone }); // a la otra persona se le actualiza el chat
     push(user.phone, "chat", { peer: other });                      // y a mis otras pestañas
     return json(res, 200, { ok: true });
